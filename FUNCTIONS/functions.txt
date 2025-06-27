@@ -1,0 +1,5530 @@
+--DROP FUNCTION account_charts_insert(_account_number character varying, _description character varying, _chart_type character varying, _report_type character varying, _chart text, should_insert boolean);
+CREATE OR REPLACE FUNCTION account_charts_insert(_account_number character varying, _description character varying, _chart_type character varying, _report_type character varying, _chart text, should_insert boolean)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+    inserted_account_number text;
+      begin
+	      IF should_insert THEN
+	      	INSERT INTO account_charts
+	      	(account_number, description, chart_type, report_type, chart)
+	        VALUES (_account_number, _description, _chart_type, _report_type, _chart)	        
+	        RETURNING account_number INTO inserted_account_number;	
+	   	  else
+	   	  	return null;
+	   	  end IF;
+	   	 RETURN inserted_account_number;
+      END;
+$function$
+;
+
+--DROP FUNCTION batch_resubmissions_insert(_data jsonb);
+CREATE OR REPLACE FUNCTION batch_resubmissions_insert(_data jsonb)
+ RETURNS integer[]
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_batch_resubmission_id int4;
+		_claims_recoverable_ids int4[];
+	begin
+
+		IF _data->>'clm01_list' IS NULL then
+
+      SELECT ARRAY_AGG(c.id)::int4[] INTO _claims_recoverable_ids
+      FROM claims_recoverable c
+      left join claims_recoverable_status s
+        on s.id = c.status_id
+      left join sub_providers sp
+        on c.sub_provider_id = sp.id
+      join providers p
+        on sp.provider_id = p.id
+      WHERE c.batch_resubmissions_id IS null
+        and p.id = cast(_data->>'provider_id' as int4)
+        and UPPER(s.name) = 'READY';
+
+		ELSE
+
+      SELECT ARRAY_AGG(c.id)::int4[] INTO _claims_recoverable_ids
+      FROM claims_recoverable c
+      left join claims_recoverable_status s
+        on s.id = c.status_id
+      left join sub_providers sp
+        on c.sub_provider_id = sp.id
+      join providers p
+        on sp.provider_id = p.id
+			WHERE provider_id = cast(_data->>'provider_id' as int4)
+        and clm01 = ANY (
+          SELECT jsonb_array_elements_text(CAST(_data->>'clm01_list' AS jsonb))
+        );
+
+		END IF;
+
+    INSERT INTO batch_resubmissions (
+      resubmission_date,
+      description,
+      provider_id
+    )
+    VALUES (
+      CAST(_data->>'resubmission_date' AS DATE),
+      _data->>'description',
+      cast(_data->>'provider_id' as int4)
+    )
+    RETURNING id INTO _batch_resubmission_id; 
+    
+    IF _claims_recoverable_ids IS NOT NULL THEN
+      UPDATE claims_recoverable c
+      SET batch_resubmissions_id = _batch_resubmission_id
+      WHERE id = ANY(_claims_recoverable_ids);
+    END IF;
+
+    RETURN _claims_recoverable_ids;
+  	END;
+$function$
+;
+
+--DROP FUNCTION check_user_permission(_user_email text, _provider_id bigint);
+CREATE OR REPLACE FUNCTION check_user_permission(_user_email text, _provider_id bigint)
+ RETURNS boolean
+ LANGUAGE plpgsql
+AS $function$
+  declare
+    _has_permission bool;
+  begin
+  
+    SELECT u.has_permission OR p.has_permission has_permission INTO _has_permission
+    FROM (
+      SELECT id user_id
+        , "admin" has_permission
+        , "email"
+      FROM users
+      WHERE email  = _user_email
+    ) u
+    LEFT JOIN (
+      SELECT user_id
+        , provider_id IS NOT NULL has_permission
+      FROM user_provider_permissions
+      WHERE provider_id = _provider_id
+    ) p
+      using(user_id);    
+  RETURN _has_permission;
+  END;
+$function$
+;
+
+--DROP FUNCTION claim_response_update(_data jsonb, _force boolean DEFAULT false);
+CREATE OR REPLACE FUNCTION claim_response_update(_data jsonb, _force boolean DEFAULT false)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_responses_835_inserted_id INT4;
+		_status_id INT4;
+		_new_status_id INT4;
+		_provider text;
+		_claim_recoverable_id INT4;
+		_balance FLOAT8;
+		_responses_835_already_exists_id text;
+		_row INT4;
+	BEGIN
+		IF UPPER(_data->>'status') <> 'ACCEPTED_AND_PAID' AND UPPER(_data->>'status') <> 'ACCEPTED_AND_ADJUSTED_PR' and
+		UPPER(_data->>'status') <> 'ACCEPTED_AND_NOT_PAID' AND UPPER(_data->>'status') <> 'PENDING_CLAWBACK' AND
+		UPPER(_data->>'status') <> 'DENIED' AND UPPER(_data->>'status') <> 'EXPIRED' THEN
+			RETURN concat('STATUS NEEDS TO BE ACCEPTED_AND_PAID, ACCEPTED_AND_ADJUSTED_PR,ACCEPTED_AND_NOT_PAID, PENDING_CLAWBACK, REJECTED OR EXPIRED TO CLAIM: ', _data->>'clm01');
+		END if;
+
+		_provider := (_data->'sub_providers'->'providers'->>'name');
+		
+		--status_verify
+		SELECT cr.status_id, cr.id INTO _status_id, _claim_recoverable_id
+		FROM claims_recoverable cr
+		JOIN sub_providers sp on cr.sub_provider_id = sp.id
+		JOIN providers p on sp.provider_id = p.id
+		WHERE
+			cr.clm01 = _data->>'clm01' AND
+			UPPER(p.name) = UPPER(_provider) AND 
+			cr.batch_resubmissions_id IS NOT NULL
+		ORDER BY cr.created_at DESC
+		LIMIT 1;
+
+		IF _claim_recoverable_id IS NULL THEN
+			return concat ('CLAIM NOT FOUND: ',_data->>'clm01');
+		END IF;
+		
+		--validate
+		IF _status_id <> 3 AND _force = FALSE THEN
+			RETURN concat('STATUS NOT PROCESSING TO CLAIM: ', _data->>'clm01');
+		END IF;
+		
+		--verifiy resposes_835
+		SELECT id INTO _responses_835_already_exists_id
+		FROM responses_835 r 
+		WHERE
+			r.claim_recoverable_id = _claim_recoverable_id;
+		
+		IF _responses_835_already_exists_id IS NOT NULL AND _force = FALSE THEN
+			RETURN concat('ALREADY EXISTS A RESPONSE TO THIS CLAIM: ', _data->>'clm01');		
+		END IF;
+
+		SELECT responses_835_insert(cast(_data as jsonb)) INTO _responses_835_inserted_id;
+		
+		IF _responses_835_inserted_id < 0 THEN
+			RETURN concat('FAIL TO INSERT RESPONSE_835 TO CLAIM: ',_data->>'clm01');
+		END IF;
+		
+		--verifica o id da claim
+		SELECT ID INTO _new_status_id 
+		FROM claims_recoverable_status crs 
+		WHERE
+			crs.name = upper(_data->>'status');
+		
+		IF _new_status_id is null then 
+			RETURN concat('FAIL TO SELECT STATUS_ID TO CLAIM: ', _data->>'clm01');
+		END IF;
+	
+		SELECT c.balance INTO _balance
+		FROM claims c
+		JOIN claims_recoverable cr ON c.account_number = cr.account_number
+		JOIN sub_providers sp ON cr.sub_provider_id = sp.id
+		JOIN providers p ON sp.provider_id = p.id
+		WHERE
+			c.account_number = _data->>'account_number' AND 
+			UPPER(p.name) = UPPER(_provider);
+		
+		--inserir log
+		INSERT INTO log_balance (clm01, last_balance, new_balance, provider)
+		VALUES (_data->>'clm01', _balance, cast(_data->>'balance' AS NUMERIC) , _provider);
+		
+		GET DIAGNOSTICS _row = ROW_COUNT;
+		IF _row <> 1 THEN
+			ROLLBACK;
+		 	RETURN concat('FAIL TO INSERT LOG OF CLAIM: ', _data->>'clm01'); 
+		END IF;
+								
+		UPDATE claims 
+		SET balance = coalesce(_balance, 0) + cast(_data->>'balance' AS numeric) 
+		WHERE account_number = _data->>'account_number';
+
+		GET DIAGNOSTICS _row = ROW_COUNT;
+		IF _row <> 1 then
+			ROLLBACK;
+			RETURN concat('FAIL TO UPDATE CLAIM BALANCE OF CLAIM: ', _data->>'clm01');
+		END IF;
+			
+		UPDATE claims_recoverable
+		SET status_id = _new_status_id 
+		WHERE id = _claim_recoverable_id;
+
+		GET DIAGNOSTICS _row = ROW_COUNT;
+		IF _row <> 1 THEN
+			ROLLBACK;
+			RETURN concat('FAIL TO UPDATE STATUS TO THIS CLAIM: ', _data->>'clm01');
+		END IF;
+	
+	RETURN 'SUCCESS';
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_cover_letter_delete(_id bigint, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_cover_letter_delete(_id bigint, _user_email text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_id_deleted int8;
+        _id_selected int8;
+        _is_default bool;
+        _deleted_at timestamp;
+	BEGIN
+        SELECT 
+            id, is_default, deleted_at  
+        from claims_attachments_cover_letter 
+        WHERE id = _id
+        INTO _id_selected, _is_default, _deleted_at;
+
+        IF (_id is null OR _is_default = TRUE OR _deleted_at IS NOT NULL) THEN
+            RETURN -404;
+        END IF;
+
+        UPDATE claims_attachments_cover_letter
+		SET
+			deleted_at = now()
+		WHERE
+			id = _id
+		RETURNING id INTO _id_deleted;
+
+	RETURN _id_deleted;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_cover_letter_insert(_encoded_data text, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_cover_letter_insert(_encoded_data text, _user_email text)
+ RETURNS bigint
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_id_inserted int8;
+        _data JSONB;
+	BEGIN
+        SELECT cast(convert_from(decode(_encoded_data, 'base64'), 'UTF8') as JSONB) INTO _data;
+
+        INSERT INTO claims_attachments_cover_letter (
+            description,
+            template,
+            provider_id,
+            enabled,
+            is_default
+        ) VALUES (
+            _data->>'description',
+            _data->>'template',
+            cast(_data->>'provider_id' as int8),
+            cast(_data->>'enabled' as bool),
+            cast(_data->>'is_default' as bool)
+        ) RETURNING id INTO _id_inserted;
+
+        IF _id_inserted IS NOT NULL and cast(_data->>'is_default' as bool) = TRUE THEN
+            PERFORM claims_attachments_cover_letter_set_default(_id_inserted, cast(_data->>'provider_id' as int8));
+        END IF;
+
+	RETURN _id_inserted;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_cover_letter_set_default(_id bigint, _provider_id bigint);
+CREATE OR REPLACE FUNCTION claims_attachments_cover_letter_set_default(_id bigint, _provider_id bigint)
+ RETURNS boolean
+ LANGUAGE plpgsql
+AS $function$
+    BEGIN
+        UPDATE claims_attachments_cover_letter
+		SET
+            is_default = FALSE,
+			updated_at = now()
+		WHERE
+            provider_id = _provider_id
+			and id <> _id
+        ;
+    RETURN true;
+    END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_cover_letter_sub_provider_delete(_cover_letter_id bigint, _sub_provider_ids bigint[], _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_cover_letter_sub_provider_delete(_cover_letter_id bigint, _sub_provider_ids bigint[], _user_email text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+    DECLARE
+        _sub_provider_id int8;
+        _sub_provider_id_deleted int8;
+        _sub_provider_ids_deleted bigint[] := '{}';
+	BEGIN
+        FOREACH _sub_provider_id IN ARRAY _sub_provider_ids LOOP
+            DELETE FROM claims_attachments_cover_letter_sub_provider 
+            WHERE cover_letter_id = _cover_letter_id and sub_provider_id = _sub_provider_id
+            RETURNING sub_provider_id INTO _sub_provider_id_deleted;
+
+            IF _sub_provider_id_deleted IS NOT NULL THEN
+                _sub_provider_ids_deleted := array_append(_sub_provider_ids_deleted, _sub_provider_id_deleted);
+            END IF;
+        END LOOP;
+    RETURN jsonb_build_object('status', 200, 'result', _sub_provider_ids_deleted);
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_cover_letter_sub_provider_insert(_cover_letter_id bigint, _sub_provider_ids bigint[], _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_cover_letter_sub_provider_insert(_cover_letter_id bigint, _sub_provider_ids bigint[], _user_email text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_cover_letter_id_inserted int8;
+        _sub_provider_id int8;
+        _sub_provider_id_inserted int8;
+        _sub_provider_ids_inserted bigint[] := '{}';
+	BEGIN
+        FOREACH _sub_provider_id IN ARRAY _sub_provider_ids LOOP
+            INSERT INTO claims_attachments_cover_letter_sub_provider (
+                cover_letter_id,
+                sub_provider_id
+            ) VALUES (
+                _cover_letter_id,
+                _sub_provider_id
+            ) ON CONFLICT (cover_letter_id, sub_provider_id) DO NOTHING
+            RETURNING cover_letter_id, sub_provider_id INTO _cover_letter_id_inserted, _sub_provider_id_inserted;
+
+            IF _sub_provider_id_inserted IS NOT NULL THEN
+                _sub_provider_ids_inserted := array_append(_sub_provider_ids_inserted, _sub_provider_id_inserted);
+            END IF;
+        END LOOP;
+        RETURN jsonb_build_object('status', 200, 'result', _sub_provider_ids_inserted);
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_cover_letter_update(_encoded_data text, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_cover_letter_update(_encoded_data text, _user_email text)
+ RETURNS bigint
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_id_updated int8;
+        _data JSONB;
+	BEGIN
+        SELECT cast(convert_from(decode(_encoded_data, 'base64'), 'UTF8') as JSONB) INTO _data;
+
+        UPDATE claims_attachments_cover_letter
+		SET
+            description = _data->>'description',
+            template = _data->>'template',
+            enabled = cast(_data->>'enabled' as bool),
+            is_default = cast(_data->>'is_default' as bool),
+			updated_at = now()
+		WHERE
+			id = cast(_data->>'id' as int8)
+            and provider_id = cast(_data->>'provider_id' as int8)
+		RETURNING id INTO _id_updated;
+
+        IF _id_updated IS NOT NULL and cast(_data->>'is_default' as bool) = TRUE THEN
+            PERFORM claims_attachments_cover_letter_set_default(_id_updated, cast(_data->>'provider_id'as int8));
+        END IF;
+
+	RETURN _id_updated;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_payer_address_delete(_id bigint, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_payer_address_delete(_id bigint, _user_email text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+   DECLARE
+      _id_deleted int8;
+      _id_selected int8;
+      _is_default bool;
+      _deleted_at timestamp;
+   BEGIN
+        SELECT id, is_default, deleted_at
+        FROM claims_attachments_payer_address
+        WHERE id = _id
+        INTO _id_selected, _is_default, _deleted_at;
+        IF (_id is null OR _is_default = TRUE OR _deleted_at IS NOT NULL) THEN
+            RETURN -404;
+        END IF;
+        UPDATE claims_attachments_payer_address
+      SET deleted_at = now()
+      WHERE id = _id
+      RETURNING id INTO _id_deleted;
+   RETURN _id_deleted;
+   END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_payer_address_insert(_data jsonb, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_payer_address_insert(_data jsonb, _user_email text)
+ RETURNS bigint
+ LANGUAGE plpgsql
+AS $function$
+  DECLARE
+    _id_inserted int8;
+  BEGIN
+        INSERT INTO claims_attachments_payer_address (
+            payer_id,
+            company_name,
+            address_line1,
+            address_line2,
+            city,
+            province_or_state,
+            postal_or_zip,
+            country_code,
+            enabled,
+            is_default,
+            extra_params
+        ) VALUES (
+            _data->>'payer_id',
+            _data->>'company_name',
+            _data->>'address_line1',
+            _data->>'address_line2',
+            _data->>'city',
+            _data->>'province_or_state',
+            _data->>'postal_or_zip',
+            _data->>'country_code',
+            cast(_data->>'enabled' as bool),
+            cast(_data->>'is_default' as bool),
+            cast(_data->>'extra_params' as jsonb)
+        ) RETURNING id INTO _id_inserted;
+        IF _id_inserted IS NOT NULL and cast(_data->>'is_default' as bool) = TRUE THEN
+            PERFORM claims_attachments_payer_address_set_default(_id_inserted, cast(_data->>'payer_id' as text));
+        END IF;
+  RETURN _id_inserted;
+  END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_payer_address_set_default(_id bigint, _payer_id text);
+CREATE OR REPLACE FUNCTION claims_attachments_payer_address_set_default(_id bigint, _payer_id text)
+ RETURNS boolean
+ LANGUAGE plpgsql
+AS $function$
+    BEGIN
+        UPDATE claims_attachments_payer_address
+		SET
+            is_default = FALSE,
+			updated_at = now()
+		WHERE
+            payer_id = _payer_id
+			AND id <> _id
+        ;
+    RETURN true;
+    END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_payer_address_update(_data jsonb, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_payer_address_update(_data jsonb, _user_email text)
+ RETURNS bigint
+ LANGUAGE plpgsql
+AS $function$
+  DECLARE
+    _id_updated int8;
+  BEGIN
+        UPDATE claims_attachments_payer_address
+    SET
+            payer_id = _data->>'payer_id',
+            company_name = _data->>'company_name',
+            address_line1 = _data->>'address_line1',
+            address_line2 = _data->>'address_line2',
+            city = _data->>'city',
+            province_or_state = _data->>'province_or_state',
+            postal_or_zip = _data->>'postal_or_zip',
+            country_code = _data->>'country_code',
+            extra_params = cast(_data->>'extra_params' as jsonb),
+            enabled = cast(_data->>'enabled' as bool),
+            is_default = cast(_data->>'is_default' as bool),
+      updated_at = now()
+    WHERE
+      id = cast(_data->>'id' as int8)
+    RETURNING id INTO _id_updated;
+        IF _id_updated IS NOT NULL and cast(_data->>'is_default' as bool) = TRUE THEN
+            PERFORM claims_attachments_payer_address_set_default(_id_updated,  cast(_data->>'payer_id' as text));
+        END IF;
+  RETURN _id_updated;
+  END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_save(_data jsonb, _user_info jsonb);
+CREATE OR REPLACE FUNCTION claims_attachments_save(_data jsonb, _user_info jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+  declare
+    _claim_recoverable_data jsonb;
+    _attachment_data jsonb;
+    _id_saved int8;
+    _claims_recoverable_attachment_id_updated int8;
+  begin
+    
+    SELECT jsonb_build_object('id', id, 'attachment_id', attachment_id) claim_data from claims_recoverable where id = cast(_data->>'claim_recoverable_id' as int8) 
+    INTO _claim_recoverable_data;
+
+    -- IF _claim_recoverable_data IS NULL THEN
+    --   RETURN jsonb_build_object('status', 400, 'result', null, 'message', 'Claim recoverable not found');
+    -- END IF;
+
+    SELECT jsonb_build_object('id', id, 'mail_status', mail_status) attachment_data from claims_attachments where id = cast(_data->>'id' as int8) 
+    INTO _attachment_data;
+
+    IF _attachment_data IS NULL THEN 
+      INSERT INTO claims_attachments (
+        account_number,
+        clm01,
+        claim_hash,
+        bht04,
+        payer_id,
+        payer_info,
+        vendor_id,
+        report_type,
+        comments,
+        claim_info,
+        contact_info,
+        mail_from,
+        mail_to,
+        mail_info,
+        cover_letter_id,
+        sub_provider_id,
+        extra_params
+      )
+      VALUES (
+        _data->>'account_number',
+        _data->>'clm01',
+        _data->>'claim_hash',
+        _data->>'bht04',
+        -- _data->>'payer_id',
+        cast(_data->>'mail_to' as jsonb)->>'payer_id',
+        cast(_data->>'payer_info' as jsonb),
+        cast(_data->>'vendor_id' as int8),
+        cast(_data->>'report_type' as claims_attachments_report_type_enum),
+        _data->>'comments',
+        cast(_data->>'claim_info' as jsonb),
+        cast(_data->>'contact_info' as jsonb),
+        cast(_data->>'mail_from' as jsonb),
+        cast(_data->>'mail_to' as jsonb),
+        cast(_data->>'mail_info' as jsonb),
+        cast(_data->>'cover_letter_id' as int8),
+        cast(_data->>'sub_provider_id' as int8),
+        cast(_data->>'extra_params' as jsonb)
+      )
+      RETURNING id INTO _id_saved;
+    ELSIF cast(_attachment_data->>'mail_status' as claims_attachments_mail_status_enum) in ('created'::claims_attachments_mail_status_enum, 'submitted'::claims_attachments_mail_status_enum, 'error'::claims_attachments_mail_status_enum) THEN
+      UPDATE claims_attachments
+      SET
+        payer_id= cast(_data->>'mail_to' as jsonb)->>'payer_id',
+        payer_info= cast(_data->>'payer_info' as jsonb),
+        vendor_id= cast(_data->>'vendor_id' as int8),
+        report_type= cast(_data->>'report_type' as claims_attachments_report_type_enum),
+        comments= _data->>'comments',
+        claim_info= cast(_data->>'claim_info' as jsonb),
+        contact_info= cast(_data->>'contact_info' as jsonb),
+        mail_from= cast(_data->>'mail_from' as jsonb),
+        mail_to= cast(_data->>'mail_to' as jsonb),
+        mail_info= cast(_data->>'mail_info' as jsonb),
+        mail_status = cast(_data->>'mail_status' as claims_attachments_mail_status_enum),
+        cover_letter_id= cast(_data->>'cover_letter_id' as int8),
+        extra_params= cast(_data->>'extra_params' as jsonb)
+      WHERE
+        id = cast(_attachment_data->>'id' as int8)
+        and mail_status in ('created', 'submitted', 'error')
+      RETURNING id INTO _id_saved;
+    ELSE
+      RETURN jsonb_build_object('status', 400, 'result', null, 'message', 'Claim attachment not found');
+    END IF;
+        
+    IF _id_saved IS NULL THEN
+      RETURN jsonb_build_object('status', 400, 'result', null, 'message', 'Something went wrong to save attachment');
+    END IF;
+
+    IF _claim_recoverable_data IS NOT NULL THEN
+	    UPDATE claims_recoverable SET attachment_id = _id_saved where id = cast(_data->>'claim_recoverable_id' as int8)
+	    RETURNING attachment_id INTO _claims_recoverable_attachment_id_updated;
+
+	    IF _claims_recoverable_attachment_id_updated <> _id_saved THEN
+	      DELETE from claims_attachments where id = _id_saved;
+	      RETURN jsonb_build_object('status', 400, 'result', null, 'message', 'Error to update claim with attachment id');
+	    END IF;
+	  END IF;
+
+    RETURN jsonb_build_object('status', 200, 'result', jsonb_build_object('id', _id_saved));
+  END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_sub_provider_address_delete(_id bigint, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_sub_provider_address_delete(_id bigint, _user_email text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_id_deleted int8;
+        _id_selected int8;
+        _is_default bool;
+        _deleted_at timestamp;
+	BEGIN
+        SELECT 
+            id, is_default, deleted_at  
+        from claims_attachments_sub_provider_address 
+        WHERE id = _id
+        INTO _id_selected, _is_default, _deleted_at;
+
+        IF (_id is null OR _is_default = TRUE OR _deleted_at IS NOT NULL) THEN
+            RETURN -404;
+        END IF;
+
+        UPDATE claims_attachments_sub_provider_address
+		SET
+			deleted_at = now()
+		WHERE
+			id = _id
+		RETURNING id INTO _id_deleted;
+
+	RETURN _id_deleted;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_sub_provider_address_insert(_data jsonb, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_sub_provider_address_insert(_data jsonb, _user_email text)
+ RETURNS bigint
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_id_inserted int8;
+	BEGIN
+
+        INSERT INTO claims_attachments_sub_provider_address (
+            description,
+            company_name,
+            address_line1,
+            address_line2,
+            city,
+            province_or_state,
+            postal_or_zip,
+            country_code,
+            contact,
+            enabled,
+            is_default,
+            sub_provider_id,
+            extra_params
+        ) VALUES (
+            _data->>'description',
+            _data->>'company_name',
+            _data->>'address_line1',
+            _data->>'address_line2',
+            _data->>'city',
+            _data->>'province_or_state',
+            _data->>'postal_or_zip',
+            _data->>'country_code',
+            cast(_data->>'contact' as jsonb),
+            cast(_data->>'enabled' as bool),
+            cast(_data->>'is_default' as bool),
+            cast(_data->>'sub_provider_id' as int8),
+            cast(_data->>'extra_params' as jsonb)
+        ) RETURNING id INTO _id_inserted;
+
+        IF _id_inserted IS NOT NULL and cast(_data->>'is_default' as bool) = TRUE THEN
+            PERFORM claims_attachments_sub_provider_address_set_default(_id_inserted, cast(_data->>'sub_provider_id' as int8));
+        END IF;
+
+	RETURN _id_inserted;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_sub_provider_address_set_default(_id bigint, _sub_provider_id bigint);
+CREATE OR REPLACE FUNCTION claims_attachments_sub_provider_address_set_default(_id bigint, _sub_provider_id bigint)
+ RETURNS boolean
+ LANGUAGE plpgsql
+AS $function$
+    BEGIN
+        UPDATE claims_attachments_sub_provider_address
+		SET
+            is_default = FALSE,
+			updated_at = now()
+		WHERE
+            sub_provider_id = _sub_provider_id
+			and id <> _id
+        ;
+    RETURN true;
+    END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_sub_provider_address_update(_data jsonb, _user_email text);
+CREATE OR REPLACE FUNCTION claims_attachments_sub_provider_address_update(_data jsonb, _user_email text)
+ RETURNS bigint
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_id_updated int8;
+	BEGIN
+
+        UPDATE claims_attachments_sub_provider_address
+		SET
+            description = _data->>'description',
+            company_name = _data->>'company_name',
+            address_line1 = _data->>'address_line1',
+            address_line2 = _data->>'address_line2',
+            city = _data->>'city',
+            province_or_state = _data->>'province_or_state',
+            postal_or_zip = _data->>'postal_or_zip',
+            country_code = _data->>'country_code',
+            contact = cast(_data->>'contact' as jsonb),
+            extra_params = cast(_data->>'extra_params' as jsonb),
+            enabled = cast(_data->>'enabled' as bool),
+            is_default = cast(_data->>'is_default' as bool),
+			updated_at = now()
+		WHERE
+			id = cast(_data->>'id' as int8)
+            and sub_provider_id = cast(_data->>'sub_provider_id' as int8)
+		RETURNING id INTO _id_updated;
+
+        IF _id_updated IS NOT NULL and cast(_data->>'is_default' as bool) = TRUE THEN
+            PERFORM claims_attachments_sub_provider_address_set_default(_id_updated, cast(_data->>'sub_provider_id'as int8));
+        END IF;
+
+	RETURN _id_updated;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_vendor_delete(_data jsonb, _user_info jsonb);
+CREATE OR REPLACE FUNCTION claims_attachments_vendor_delete(_data jsonb, _user_info jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+    DECLARE
+        _id_deleted int8;
+	BEGIN
+        UPDATE claims_attachments_vendor
+        SET
+            updated_at = now(),
+            deleted_at = now()
+        WHERE
+			id = cast(_data->>'id' as int8)
+        RETURNING id INTO _id_deleted;
+
+        IF _id_deleted IS NULL THEN
+            RETURN jsonb_build_object('status', 400, 'result', null);
+        END IF;
+
+        RETURN jsonb_build_object('status', 200, 'result', jsonb_build_object('id', _id_deleted));
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_vendor_insert(_data jsonb, _user_info jsonb);
+CREATE OR REPLACE FUNCTION claims_attachments_vendor_insert(_data jsonb, _user_info jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+    DECLARE
+        _id_inserted int8;
+	BEGIN
+        INSERT INTO claims_attachments_vendor (
+            name,
+            hash,
+            by_mail,
+            fax,
+            edi_275,
+            description,
+            is_default
+        ) VALUES (
+            _data->>'name',
+            upper(_data->>'hash'),
+            cast(_data->>'by_mail' as bool),
+            cast(_data->>'fax' as bool),
+            cast(_data->>'edi_275' as bool),
+            _data->>'description',
+            cast(_data->>'is_default' as bool)
+        )
+        RETURNING id INTO _id_inserted;
+
+        IF _id_inserted IS NOT NULL and cast(_data->>'is_default' as bool) = TRUE THEN
+            PERFORM claims_attachments_vendor_set_default(_id_inserted);
+        END IF;
+
+        IF _id_inserted IS NULL THEN
+            RETURN jsonb_build_object('status', 400, 'result', null);
+        END IF;
+
+        RETURN jsonb_build_object('status', 200, 'result', jsonb_build_object('id', _id_inserted));
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_vendor_set_default(_id bigint);
+CREATE OR REPLACE FUNCTION claims_attachments_vendor_set_default(_id bigint)
+ RETURNS boolean
+ LANGUAGE plpgsql
+AS $function$
+    BEGIN
+        UPDATE claims_attachments_vendor
+		SET
+            is_default = FALSE,
+			updated_at = now()
+		WHERE
+			id <> _id
+        ;
+    RETURN true;
+    END;
+$function$
+;
+
+--DROP FUNCTION claims_attachments_vendor_update(_data jsonb, _user_info jsonb);
+CREATE OR REPLACE FUNCTION claims_attachments_vendor_update(_data jsonb, _user_info jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+    DECLARE
+        _id_updated int8;
+	BEGIN
+        UPDATE claims_attachments_vendor
+        SET
+            name = _data->>'name',
+            hash = upper(_data->>'hash'),
+            by_mail = cast(_data->>'by_mail' as bool),
+            fax = cast(_data->>'fax' as bool),
+            edi_275 = cast(_data->>'edi_275' as bool),
+            description = _data->>'description',
+            is_default = cast(_data->>'is_default' as bool),
+            updated_at = now()
+        WHERE
+			id = cast(_data->>'id' as int8)
+        RETURNING id INTO _id_updated;
+
+        IF _id_updated IS NOT NULL and cast(_data->>'is_default' as bool) = TRUE THEN
+            PERFORM claims_attachments_vendor_set_default(_id_updated);
+        END IF;
+
+        IF _id_updated IS NULL THEN
+            RETURN jsonb_build_object('status', 400, 'result', null);
+        END IF;
+
+        RETURN jsonb_build_object('status', 200, 'result', jsonb_build_object('id', _id_updated));
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_balance_and_status_update();
+CREATE OR REPLACE FUNCTION claims_balance_and_status_update()
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_claims_updated integer;
+	begin
+
+	-- Update balance
+
+	update claims c
+	set balance = new_balance, balance_clp04 = new_balance_clp04, balance_clp05 = new_balance_clp05
+	from (
+		select tr.account_number, p.id as provider_id,
+		round (coalesce(sum(balance_clp04), 0) + coalesce(sum(balance_clp05), 0) + coalesce(sum(adjustment_clp05), 0)::numeric ,2)  as new_balance, 
+		round((coalesce(sum(balance_clp04), 0))::numeric, 2) as new_balance_clp04, 
+		round(coalesce(sum(balance_clp05), 0)::numeric + coalesce(sum(adjustment_clp05), 0)::numeric, 2) as new_balance_clp05
+		from (
+			select
+				distinct
+					account_number,
+					provider
+			from temp.temporary_responses_835 
+		) tr 
+		join claims_recoverable cr on tr.account_number = cr.account_number 
+		join sub_providers sp on cr.sub_provider_id = sp.id 
+		join providers p on sp.provider_id = p.id and tr.provider = p."name"
+		join responses_835 r on cr.id = r.claim_recoverable_id 
+		group by
+			tr.account_number, p.id
+	) t
+	where
+		c.account_number = t.account_number and c.provider_id = t.provider_id;
+	
+	-- Update main status
+
+	update claims_recoverable cr
+	set 
+		status_id = claim_status_id,
+		updated_at = now()
+	from (
+		select
+			id,
+			case
+				when last_status_id = 6 and sum(balance_clp04) = 0 and sum(balance_clp05) = 0 then 6
+				when sum(balance_clp04) > 0 then 7
+				when sum(balance_clp04) < 0 or sum(balance_clp04) < 0 then 10
+				when sum(balance_clp05) > 0 then 8
+				when last_status_id = 138 and sum(balance_clp04) = 0 and sum(balance_clp05) = 0 and (sum(has_payment) = 0 or sum(has_clawback) = 0) then 138
+				when sum(balance_clp04) = 0 and sum(balance_clp05) = 0 and (sum(has_payment) = 0 or sum(has_clawback) = 0)  then 5
+				when (sum(balance_clp04) = 0 and sum(balance_clp05) = 0) and (sum(has_payment) > 0 or sum(has_clawback) > 0) then 9
+				else
+				last_status_id
+			end claim_status_id
+		from (
+			select
+				c.id,
+				balance_clp04,
+				balance_clp05,
+				case when balance_clp04 > 0 then 1 else 0 end has_payment,
+				case when balance_clp04 < 0 then 1 else 0 end has_clawback,
+				first_value(r.status_id) over (partition by c.id order by r.created_at desc) last_status_id
+			from (
+				select
+					cr.account_number,
+					max(cr.id) id
+				from claims_recoverable cr 
+				join sub_providers sp on cr.sub_provider_id = sp.id
+				join providers p on sp.provider_id = p.id 
+				join temp.temporary_responses_835 tr on cr.account_number = tr.account_number 
+				where
+					p."name" = tr.provider and
+					batch_resubmissions_id is not null
+				group by
+					cr.account_number 
+			) c 
+			join responses_835 r on c.id = r.claim_recoverable_id 
+		) t
+		group by
+			id,
+			last_status_id
+	) t 
+	where cr.id = t.id;
+	
+	GET DIAGNOSTICS _claims_updated = ROW_COUNT;
+
+	RETURN _claims_updated;
+  	END;
+$function$
+;
+
+--DROP FUNCTION claims_divergent_waiting_actions(_data jsonb, _remove boolean);
+CREATE OR REPLACE FUNCTION claims_divergent_waiting_actions(_data jsonb, _remove boolean)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+	_id int4;
+begin
+	select id into _id
+	from claims_divergent_waiting
+	where account_number = _data->>'account_number' AND provider_id = (_data->>'provider_id')::INT4;
+    
+	if _remove then
+		delete from claims_divergent_waiting where id = _id;
+		return 'Dado removido com sucesso';
+	end if;
+
+	if _id > 0 then
+	    UPDATE claims_divergent_waiting
+	    SET 
+	        balance_clp04 = (_data->>'balance_clp04')::NUMERIC,
+	        balance_clp05 = (_data->>'balance_clp05')::NUMERIC,
+	        comments = _data->>'comments',
+	        updated_at = now()
+	    WHERE id = _id;
+	   return 'Dados alterados com sucesso';
+	end if;    
+        INSERT INTO claims_divergent_waiting (
+            account_number, 
+            provider_id, 
+            balance_clp04, 
+            balance_clp05, 
+            comments, 
+            created_at, 
+            updated_at
+        ) VALUES (
+            _data->>'account_number', 
+            (_data->>'provider_id')::INT4, 
+            (_data->>'balance_clp04')::NUMERIC, 
+            (_data->>'balance_clp05')::NUMERIC, 
+            _data->>'comments', 
+            now(), 
+            now()
+        );
+    	return 'Dados inseridos com sucesso';
+END;
+$function$
+;
+
+--DROP FUNCTION claims_from_all_temp_to_responses_835_insert();
+CREATE OR REPLACE FUNCTION claims_from_all_temp_to_responses_835_insert()
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_responses jsonb[];
+		_resp jsonb;
+		_responses_835_inserted_id int4;
+		_responses_added integer;
+        _sp_expected_amount float8;
+		_balance_clp04 float8;
+	begin
+		_responses_added = 0;
+	
+		select
+			array_agg(json_data) into _responses
+		from (
+			select 
+				json_build_object(
+					'clm01', clm01,
+					'account_number', account_number,
+					'file_name', file_name,
+					'file_hash', file_hash,
+					'claim_hash',claim_hash,
+					'clp02', clp02,
+					'clp04', clp04,
+					'clp05', clp05,
+					'clp07',clp07,
+					'bpr16', bpr16,
+					'date_parser', date_parser,
+					'payers', json_build_object('name', payer),
+					'sub_providers', json_build_object('acronym',sub_provider, 'providers', json_build_object('name', provider)),
+					'balance', balance,
+					'reason_code', case when status IN ('DENIED', 'EXPIRED') then reason_codes else '{}'::jsonb end,
+					'status', status,
+					'balance_clp04', balance_clp04,
+					'balance_clp05', balance_clp05,
+					'adjustment_clp05', 0
+				) AS json_data
+			from temp.temporary_responses_835 tr 
+			where 
+				claim_hash not in (select claim_hash from responses_835 r)
+			order by
+				account_number,
+				date_parser,
+				clp02 desc,
+				clp04
+		) t;
+
+		if (_responses is not null) then 
+			foreach _resp in array _responses
+			loop
+				_balance_clp04 = CAST(_resp->>'balance_clp04' AS NUMERIC);
+
+				if (CAST(_resp->>'payers' AS JSONB)->>'name' = 'SP' and _balance_clp04 > 0) then
+					_sp_expected_amount = 0;
+
+					select
+						sum(r.balance_clp05 + r.adjustment_clp05) into _sp_expected_amount
+					from claims_recoverable cr
+					join responses_835 r on cr.id = r.claim_recoverable_id
+					where
+						cr.account_number = CAST(_resp->>'account_number' AS TEXT);
+
+                    if (_sp_expected_amount > 0) then
+						if (_sp_expected_amount >= _balance_clp04) then
+							_resp = jsonb_set(_resp, '{adjustment_clp05}', CAST(_balance_clp04 * -1 AS TEXT)::jsonb);
+						else
+							_resp = jsonb_set(_resp, '{adjustment_clp05}', CAST(_sp_expected_amount * -1 AS TEXT)::jsonb);
+						end if;
+					end if;
+				end if;
+
+				SELECT responses_835_insert(cast(_resp as jsonb)) INTO _responses_835_inserted_id;
+	
+				IF _responses_835_inserted_id > 0 THEN 
+					_responses_added = _responses_added + 1;
+				END IF;
+			end loop;
+		end if;
+
+		RETURN _responses_added;
+  	END;
+$function$
+;
+
+--DROP FUNCTION claims_initial_values_insert(_provider text);
+CREATE OR REPLACE FUNCTION claims_initial_values_insert(_provider text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_provider_id integer;
+		_claims_added integer;
+	begin
+		select id into _provider_id
+		from providers 
+		where UPPER("name") = UPPER(_provider);
+	
+		if (_provider_id is not null) then 
+			insert into claims_initial_values (account_number, provider_id, initial_clp04, initial_clp05)
+			select t1.account_number, _provider_id as provider_id, round(coalesce(sum(cast(amount as numeric)), 0)::numeric, 2) initial_clp04, 0 as initial_clp05
+			from (
+				select a.account_number, a.resubmission_date
+				from (
+					select cr.account_number, min(br.resubmission_date) as resubmission_date
+					from claims_recoverable cr 
+					join sub_providers sp on cr.sub_provider_id = sp.id 
+					join batch_resubmissions br on cr.batch_resubmissions_id = br.id
+					where sp.provider_id = _provider_id
+					group by cr.account_number
+				) a 
+				left join (
+					select account_number
+					from claims_initial_values civ 
+					where provider_id = _provider_id
+					group by account_number 
+				) b on a.account_number = b.account_number 
+				where b.account_number is null
+			) t1 
+			left join raw.claims_transactions ct on t1.account_number = ct.account_number and date(transaction_service_date) < resubmission_date and date(transaction_batch_date) < resubmission_date
+			group by t1.account_number;
+		
+			GET DIAGNOSTICS _claims_added = ROW_COUNT;
+
+		end if;
+		RETURN _claims_added;
+  	END;
+$function$
+;
+
+--DROP FUNCTION claims_insert(_data jsonb);
+CREATE OR REPLACE FUNCTION claims_insert(_data jsonb)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_claims_recoverable_type_id int4;
+        _account_number_provider_exists int4;
+	BEGIN
+	
+  -- providers
+  SELECT c.id into _account_number_provider_exists
+  FROM claims_recoverable c
+  left join sub_providers sp
+    on c.sub_provider_id = sp.id
+  join providers p
+    on sp.provider_id = p.id
+  WHERE p.id = cast(_data->>'provider_id' as int4)
+	  and c.account_number = _data->>'account_number'; 
+
+  IF ( _account_number_provider_exists IS NULL ) THEN
+    RETURN '-1';
+  END IF;
+
+  -- claims_recoverable_type
+	SELECT claims_recoverable_type_insert(CAST(_data->>'claims_recoverable_type' AS JSONB)) INTO _claims_recoverable_type_id;
+			
+  INSERT INTO claims (
+    --clm01,
+    account_number,
+    provider_id,
+    clp04,
+    balance,
+    claims_recoverable_type_id
+  )
+  VALUES (
+    --_data->>'clm01',
+    _data->>'account_number',
+    cast(_data->>'provider_id' as int4),
+    CAST(_data->>'clp04' AS DOUBLE PRECISION),
+    CAST(_data->>'balance' AS DOUBLE PRECISION),
+    _claims_recoverable_type_id
+  )
+  ON CONFLICT(account_number,provider_id) 
+  DO nothing;
+  /*
+  UPDATE SET account_number = _data->>'account_number',
+  
+    clp04 = CAST(_data->>'clp04' AS DOUBLE PRECISION),
+    balance = CAST(_data->>'balance' AS DOUBLE PRECISION),
+    claims_recoverable_type_id = _claims_recoverable_type_id,
+    updated_at = now();
+  */
+	RETURN _data->>'account_number';
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_recoverable_835_insert(_data jsonb);
+CREATE OR REPLACE FUNCTION claims_recoverable_835_insert(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_claim_recoverable_id_used int4;
+		_payers_data JSONB;
+		_payer_id int4;
+	begin
+
+		-- payers
+		SELECT jsonb_build_object('name', _data->>'payer_n102') INTO _payers_data;
+		SELECT payers_insert(_payers_data) INTO _payer_id;
+
+		INSERT INTO claims_recoverable_835 (
+			claim_recoverable_id,
+			file_hash,
+			claim_hash,
+			file_name,
+			bpr16,
+			clp01,
+			clp04,
+			clp02,
+			clp03,
+			nm109_il,
+			clp06,
+			clp07,
+			payer_n102,
+			date_parser,
+			nm109_qc,
+			nm109_74,
+			payer_id
+		)
+		VALUES (
+			CAST(_data->>'claim_recoverable_id' AS INT4),
+			_data->>'file_hash',
+			_data->>'claim_hash',
+			_data->>'file_name',
+			CAST(_data->>'bpr16' AS DATE),
+			_data->>'clp01',
+			CAST(_data->>'clp04' AS DOUBLE PRECISION),
+			CAST(_data->>'clp02' AS NUMERIC),
+			_data->>'clp03',
+			_data->>'nm109_il',
+			_data->>'clp06',
+			_data->>'clp07',
+			_data->>'payer_n102',
+			CAST(_data->>'date_parser' AS DATE),
+			_data->>'nm109_qc',
+			_data->>'nm109_74',
+			_payer_id
+		)
+		RETURNING claim_recoverable_id INTO _claim_recoverable_id_used;	
+	RETURN _claim_recoverable_id_used;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_recoverable_add_description(_data jsonb, _user_email text);
+CREATE OR REPLACE FUNCTION claims_recoverable_add_description(_data jsonb, _user_email text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_user_id int4;
+		_has_permission bool;
+		_result jsonb;
+	begin
+
+		SELECT ("admin") OR (p.id IS NOT NULL) INTO _has_permission
+		from users u
+		LEFT JOIN (
+			SELECT id, user_id
+			FROM user_provider_permissions
+			WHERE provider_id = CAST(_data->>'provider_id' AS INT)
+		) p
+			ON u.id = p.user_id
+		where upper(email ) = upper(_user_email);
+				
+		IF NOT _has_permission OR _has_permission IS NULL THEN 
+			SELECT jsonb_build_object(
+				'status_code', 200,
+				'user_email', _user_email
+			) INTO _result;
+			RETURN _result;
+		END IF;
+
+		UPDATE claims_recoverable
+		SET description = _data->>'description'
+		WHERE id = CAST(_data->>'claim_recoverable_id' AS INT);
+
+	SELECT jsonb_build_object(
+		'status_code', 200,
+		'user_email', _user_email
+	) INTO _result;
+	
+	RETURN _result;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_recoverable_amount_aging_full_insert();
+CREATE OR REPLACE FUNCTION claims_recoverable_amount_aging_full_insert()
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_row INT4;
+		_raw_rows INT4;
+	begin
+
+		SELECT COUNT(1) INTO _raw_rows FROM raw.recoverable_amount_aging;
+
+		IF (_raw_rows> 0) THEN
+			DELETE FROM claims_recoverable_amount_aging;
+		
+			INSERT INTO claims_recoverable_amount_aging
+			SELECT
+				date(dt),
+				cast(general_total_recoverable AS int4),
+				cast(general_total_recoverable_amount AS float8),
+				cast(total_recoverable AS int4),
+				cast(total_recoverable_amount AS float8),
+				cast(total_potentially_recoverable AS int4),
+				cast(total_amount_potentially_recoverable AS float8),
+				sp.id
+			FROM raw.recoverable_amount_aging rag 
+			JOIN sub_providers sp ON rag.sub_provider = sp.acronym 
+			JOIN providers p ON sp.provider_id = p.id AND rag.provider = p."name";
+		
+			GET DIAGNOSTICS _row = ROW_COUNT;
+			IF (_row > 0 ) then
+				RETURN _row;
+			ELSE
+				ROLLBACK;
+			    RETURN 0;
+			END IF;
+		ELSE 
+			RETURN 0;
+		END IF;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_recoverable_amount_denied_full_insert();
+CREATE OR REPLACE FUNCTION claims_recoverable_amount_denied_full_insert()
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_row INT4;
+		_raw_rows INT4;
+	begin
+
+		SELECT COUNT(1) INTO _raw_rows FROM raw.recoverable_amount_denied;
+
+		IF (_raw_rows> 0) THEN
+			DELETE FROM claims_recoverable_amount_denied;
+		
+			INSERT INTO claims_recoverable_amount_denied
+			SELECT
+				date(dt),
+				cast(total_recoverable AS int4),
+				cast(total_recoverable_amount AS float8),
+				cast(total_potentially_recoverable AS int4),
+				cast(total_amount_potentially_recoverable AS float8),
+				sp.id
+			FROM raw.recoverable_amount_denied rad 
+			JOIN sub_providers sp ON rad.sub_provider = sp.acronym 
+			JOIN providers p ON sp.provider_id = p.id AND rad.provider = p."name";
+		
+			GET DIAGNOSTICS _row = ROW_COUNT;
+			IF (_row > 0 ) then
+				RETURN _row;
+			ELSE
+				ROLLBACK;
+			    RETURN 0;
+			END IF;
+		ELSE 
+			RETURN 0;
+		END IF;
+	END;
+$function$
+;
+
+--DROP FUNCTION claims_recoverable_bypass_edi_update(_data jsonb);
+CREATE OR REPLACE FUNCTION claims_recoverable_bypass_edi_update(_data jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		id_updated int4;
+	begin
+	    update claims_recoverable
+		set
+			bypass_edi = (_data->>'bypass_edi')::boolean,
+			updated_at = now()
+		where
+		    id = (_data->>'claim_recoverable_id')::int
+        returning id into id_updated;
+		RETURN id_updated;
+	END
+$function$
+;
+
+--DROP FUNCTION claims_recoverable_comments_insert(_data jsonb, _user_info jsonb);
+CREATE OR REPLACE FUNCTION claims_recoverable_comments_insert(_data jsonb, _user_info jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+    DECLARE
+        _claim_recoverable_id int8;
+        _user_email text; 
+        _created_at timestamp;
+        _status_id int8;
+	BEGIN
+        SELECT status_id FROM claims_recoverable WHERE id = cast(_data->>'claim_recoverable_id' as int8) INTO _status_id;
+
+        INSERT INTO claims_recoverable_comments (
+            claim_recoverable_id,
+            claim_status_id,
+            user_id,
+            user_email,
+            user_info,
+            comment,
+            comment_type,
+            extra_params,
+            created_at
+        ) VALUES (
+            cast(_data->>'claim_recoverable_id' as int8),
+            _status_id,
+            cast(_user_info->>'user_id' as int8),
+            _user_info->>'email',
+            _user_info,
+            _data->>'comment',
+            cast(_data->>'comment_type' as claims_recoverable_comments_type_enum),
+            cast(_data->>'extra_params' as jsonb),
+            now()
+        ) ON CONFLICT (claim_recoverable_id, user_email, created_at) DO NOTHING
+        RETURNING claim_recoverable_id, user_email, created_at INTO _claim_recoverable_id, _user_email, _created_at;
+
+        IF _claim_recoverable_id IS NULL THEN
+            RETURN jsonb_build_object('status', 400, 'result', null);
+        END IF;
+
+        RETURN jsonb_build_object('status', 200, 'result', jsonb_build_object('claim_recoverable_id', _claim_recoverable_id, 'user_email', _user_email, 'created_at', _created_at));
+	END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_edi_insert(jsonb);
+CREATE OR REPLACE FUNCTION claims_recoverable_edi_insert(_data jsonb)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		claim_recoverable_id_inserted int4;
+		_edi_resubmission text;
+		_edi_resubmission_parsed text;
+	begin
+
+		select claim_recoverable_id INTO claim_recoverable_id_inserted
+		from claims_recoverable_edi
+		where claim_recoverable_id = CAST(_data->>'claim_recoverable_id' AS int4);
+
+		IF(claim_recoverable_id_inserted IS NOT NULL) THEN
+			RETURN claim_recoverable_id_inserted;
+		END IF;
+
+		IF _data->>'edi_resubmission' IS NULL THEN
+			SELECT _data->>'edi_pre_proc' INTO _edi_resubmission;
+		ELSE
+			SELECT _data->>'edi_resubmission' INTO _edi_resubmission;
+		END IF;
+
+		IF _data->>'edi_resubmission_parsed' IS NULL THEN
+			SELECT _data->>'edi_pre_proc_parsed' INTO _edi_resubmission_parsed;
+		ELSE
+			SELECT _data->>'edi_resubmission_parsed' INTO _edi_resubmission_parsed;
+		END IF;
+
+		INSERT INTO claims_recoverable_edi (
+			claim_recoverable_id,
+			edi_pre_proc,
+			edi_pre_proc_parsed,
+			edi_resubmission,
+			edi_resubmission_parsed
+		)
+		VALUES (
+			CAST(_data->>'claim_recoverable_id' AS int4),
+			_data->>'edi_pre_proc',
+			_data->>'edi_pre_proc_parsed',
+			_edi_resubmission,
+			_edi_resubmission_parsed
+
+		) RETURNING claim_recoverable_id INTO claim_recoverable_id_inserted;
+		
+		RETURN claim_recoverable_id_inserted;
+	END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_edi_update(int4, text, text);
+CREATE OR REPLACE FUNCTION claims_recoverable_edi_update(_claim_recoverable_id integer, _edi_resubmission text, _edi_resubmission_parsed text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		id_updated int4;
+	begin
+		IF NOT EXISTS(
+			SELECT 1 FROM claims_recoverable
+			WHERE
+                id = _claim_recoverable_id
+				and status_id IN (select id from claims_recoverable_status where name in ('OPENED', 'TO_VALIDATE', 'ATTACHMENTS_WAITING_TR', 'ATTACHMENTS_WAITING_DELIVERY', 'QA', 'QA_PRE_CLIENT', 'QA_PRE_CLIENT_REJECTED', 'QA_CLIENT', 'QA_REJECTED', 'QA_CLIENT_IN_ANALYSIS', 'QA_CLIENT_REJECTED', 'QA_CLIENT_APPROVED', 'QA_CLIENT_FURTHER'))
+		) THEN
+	  		RETURN NULL;
+		else
+			update claims_recoverable_edi
+			set
+				edi_resubmission = _edi_resubmission,
+				edi_resubmission_parsed = _edi_resubmission_parsed,
+				updated_at = now()
+			where
+				claim_recoverable_id = _claim_recoverable_id
+			returning claim_recoverable_id into id_updated;
+			RETURN id_updated;
+		end if;
+	END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_frequency_code_update(int4, int4);
+CREATE OR REPLACE FUNCTION claims_recoverable_frequency_code_update(_id integer, _frequency_code integer)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		id_updated int4;
+	begin
+		update claims_recoverable
+		set
+			frequency_code = _frequency_code, updated_at = now()
+		where
+			id = _id
+		    and status_id in (select distinct id from claims_recoverable_status where name in ('OPENED', 'TO_VALIDATE', 'ATTACHMENTS_WAITING_TR', 'ATTACHMENTS_WAITING_DELIVERY', 'QA', 'QA_PRE_CLIENT', 'QA_PRE_CLIENT_REJECTED', 'QA_CLIENT', 'QA_REJECTED', 'QA_CLIENT_IN_ANALYSIS', 'QA_CLIENT_REJECTED', 'QA_CLIENT_APPROVED', 'QA_CLIENT_FURTHER'))
+		returning id into id_updated;
+		RETURN id_updated;
+	END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_insert(text, text);
+CREATE OR REPLACE FUNCTION claims_recoverable_insert(_encoded_data text, _user_email text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_claim_recoverable_id_inserted int4;
+
+		_user_fixer_id INT4;
+		_claims_recoverable_status_id INT4;
+		_payer_id INT4;
+		_provider_id INT4;
+		_sub_provider_id INT4;
+		_clm01_returned TEXT;
+		_claim_recoverable_edi_recoverable_id_inserted INT4;
+		_response_835_clm01_inserted TEXT;
+		_li JSONB;
+		_inserted_line_item_id int4;
+		_claims_recoverable_recoverable_type_id int4;
+		_claims_payer_nm109_id int4;
+		_claims_contract_type_id int4;
+
+		_data JSONB;
+		_claims_data JSONB;
+		_claims_recoverable_type_data JSONB;
+		_claims_recoverable_status_data JSONB;
+		_claims_payer_nm109_data JSONB;
+		_payers_data JSONB;
+		_providers_data JSONB;
+		_sub_providers_data JSONB;
+
+		_claim_recoverable_reason_code_id int4;
+		_claim_recoverable_remark_code_id int4;
+		_claim_recoverable_revenue_code_id int4;
+		_claim_recoverable_tags_id int4;
+		_revenue_codes TEXT[] := '{}';
+		_remark_codes TEXT[];
+		_claims_tag TEXT[];
+
+		_journal_data JSONB;
+		_has_permission int4;
+	begin
+
+		SELECT cast(convert_from(decode(_encoded_data, 'base64'), 'UTF8') as JSONB) INTO _data;
+
+		SELECT 1 INTO _has_permission
+		from users u 
+		where "admin" = true
+			and upper(email ) = upper(_user_email);
+
+		IF(_has_permission IS NULL) THEN
+			SELECT upp.id INTO _has_permission
+			FROM (
+				SELECT id
+				FROM providers p
+				WHERE UPPER(p."name") = UPPER(_data->>'provider')
+			) "provider"
+			CROSS JOIN (
+				SELECT id
+				FROM users u
+				WHERE UPPER(u."email") = UPPER(_user_email)
+			) "user"
+			JOIN user_provider_permissions upp
+				ON upp.user_id = "user".id
+					AND upp.provider_id = "provider".id;
+		END IF;
+
+		-- exit if _data->>'claim_contract_type' is null 
+		IF (_data->>'claim_contract_type' = '') THEN
+			RETURN -666;
+		END IF;
+
+		-- User Fixer
+		SELECT id INTO _user_fixer_id
+		from users u
+		where upper(email) = upper(_user_email)
+			and fixer;
+
+		if _user_fixer_id is null then
+			RETURN -401;
+		end if;
+			
+		-- Journal(debug)
+		SELECT cast(convert_from(decode(_encoded_data, 'base64'), 'UTF8') as JSONB) INTO _journal_data;
+	
+		IF(_has_permission IS NULL) THEN
+			-- Journal(debug)
+			INSERT INTO claims_recoverable_journal("claims_recoverable_id", "user_email", "_data")
+			VALUES(_claim_recoverable_id_inserted, _user_email, _journal_data);
+
+			RETURN -401;
+		END IF;
+
+		-- providers
+		SELECT jsonb_build_object('name', _data->>'provider') INTO _providers_data;
+		SELECT providers_insert(_providers_data) INTO _provider_id;
+
+		-- sub_providers
+		SELECT 	jsonb_build_object('acronym', _data->>'sub_provider') || 
+				jsonb_build_object('providers', _providers_data) || 
+                jsonb_build_object('sub_provider_tax_id', _data->>'sub_provider_tax_id')
+		INTO _sub_providers_data;
+		SELECT sub_providers_insert(_sub_providers_data) INTO _sub_provider_id;
+
+		SELECT -409 INTO _claim_recoverable_id_inserted
+		FROM claims_recoverable c
+		WHERE bht04 = CAST(_data->>'bht04' AS DATE)
+			AND c.sub_provider_id = _sub_provider_id
+			AND c.clm01 = _data->>'clm01';
+		
+		IF( _claim_recoverable_id_inserted IS NULL ) THEN
+		
+			-- payers
+			SELECT jsonb_build_object('name', _data->>'payer_nm103') INTO _payers_data;
+			SELECT payers_insert(_payers_data) INTO _payer_id;
+		
+			-- claims_recoverable_status
+			SELECT jsonb_build_object('name', _data->>'status') INTO _claims_recoverable_status_data;
+			SELECT claims_recoverable_status_insert(_claims_recoverable_status_data) INTO _claims_recoverable_status_id;
+			
+			-- claims_recoverable_type
+			SELECT jsonb_build_object('type_name', _data->>'recoverable_type') INTO _claims_recoverable_type_data;
+			SELECT claims_recoverable_type_insert(_claims_recoverable_type_data) INTO _claims_recoverable_recoverable_type_id;
+			
+			-- claims_contract_type (HISTORICAL/REALTIME)
+			SELECT claim_contract_type_get(_data->>'claim_contract_type') INTO _claims_contract_type_id;
+
+			-- payers_nm109 (plan code)
+			SELECT jsonb_build_object('name', _data->>'payer_nm109') || jsonb_build_object('provider', _data->>'provider') INTO _claims_payer_nm109_data;
+			SELECT payers_nm109_insert(_claims_payer_nm109_data) INTO _claims_payer_nm109_id;
+
+			-- claims_recoverable
+			INSERT INTO claims_recoverable (
+				clm01,
+				file_hash,
+				file_name,
+				date_parser,
+				bht04,
+				claim_hash,
+				clm02,
+                clm05_1,
+				file_type,
+				next_ref02_f8,
+				frequency_code,
+				reason_code,
+				account_number,
+				total_reason_amount,
+				extra_params,
+				description,
+				recoverable_type_id,
+				total_predicted_amount,
+				total_predicted_perc,
+				status_id,
+				payer_id,
+				sub_provider_id,
+				user_fixer_id,
+				payer_nm109,
+				payer_nm109_id,
+				sbr09,
+				rarcs,
+				claims_contract_type_id,
+				tags,
+				tax_id
+			) VALUES (
+				_data->>'clm01',
+				_data->>'file_hash',
+				_data->>'file_name',
+				CAST(_data->>'date_parser' AS DATE),
+				CAST(_data->>'bht04' AS DATE),
+				_data->>'claim_hash',
+				_data->>'clm02',
+				_data->>'clm05_1',
+				_data->>'file_type',
+				_data->>'next_ref02_f8',
+				COALESCE(CAST(_data->>'frequency_code' AS INT), 7),
+				CAST(_data->>'reason_code' AS JSONB),
+				_data->>'account_number',
+				CAST(_data->>'total_reason_amount' AS NUMERIC),
+				_data->>'extra_params',
+				_data->>'description',
+				_claims_recoverable_recoverable_type_id,
+				CAST(_data->>'total_predicted_amount' AS NUMERIC),
+				CAST(_data->>'total_predicted_perc' AS NUMERIC),
+				_claims_recoverable_status_id,
+				_payer_id,
+				_sub_provider_id,
+				_user_fixer_id,
+				_data->>'payer_nm109',
+				_claims_payer_nm109_id,
+				_data->>'sbr09',
+				CAST(_data->>'rarcs' AS JSONB),
+				_claims_contract_type_id,
+				CAST(_data->>'tags' AS JSONB),
+				COALESCE(_data->>'sub_provider_tax_id', '')
+			) RETURNING id INTO _claim_recoverable_id_inserted;
+		
+			-- claims
+			SELECT 	--jsonb_build_object('clm01', _data->>'clm01') ||
+							jsonb_build_object('clp04', _data->>'clp04') ||
+							jsonb_build_object('provider_id', _provider_id) ||
+							jsonb_build_object('balance', _data->>'balance') ||
+							jsonb_build_object('account_number', _data->>'account_number') ||
+							jsonb_build_object('claims_recoverable_type', _claims_recoverable_type_data)
+			INTO _claims_data;
+
+			SELECT claims_insert(_claims_data) INTO _clm01_returned;
+
+			-- claim_recoverable_edi
+			SELECT claims_recoverable_edi_insert(
+				cast(
+					_data->>'claims_recoverable_edi' AS JSONB) || 
+					jsonb_build_object('claim_recoverable_id', _claim_recoverable_id_inserted
+				)
+
+			) INTO _claim_recoverable_edi_recoverable_id_inserted;
+
+			-- claim_recoverable_835
+			IF _data->>'claims_recoverable_835' IS NOT NULL THEN
+				SELECT  claims_recoverable_835_insert(
+					CAST(_data->>'claims_recoverable_835' AS JSONB) || 
+					jsonb_build_object(
+						'claim_recoverable_id', _claim_recoverable_id_inserted,
+						'payer_n102', _data->>'payer_nm103'
+					) 
+				) INTO _response_835_clm01_inserted;
+			END IF;
+
+			-- line_item_recoverable
+			FOR _li IN SELECT * FROM jsonb_array_elements(CAST( _data->>'line_items_recoverable' AS JSONB))
+			LOOP
+					SELECT line_items_recoverable_insert(
+						_li || jsonb_build_object('claim_recoverable_id', _claim_recoverable_id_inserted)
+					) INTO _inserted_line_item_id;
+
+					--revenue_code
+					IF COALESCE(_li->>'revenue_code', '') <> '' THEN
+					  _revenue_codes := array_append(_revenue_codes, _li->>'revenue_code');
+					END IF;
+			END LOOP;
+							
+			-- claims_recoverable_reason_code
+			SELECT claim_recoverable_reason_code_insert(_claim_recoverable_id_inserted, CAST(_data->>'reason_code' AS JSONB) ) INTO _claim_recoverable_reason_code_id;
+
+			--claims_recoverable_remark_code
+			SELECT ARRAY(SELECT jsonb_array_elements_text(_data->'rarcs')) INTO _remark_codes;
+ 			SELECT claim_recoverable_remark_code_insert(_claim_recoverable_id_inserted, _remark_codes) INTO _claim_recoverable_remark_code_id;
+
+			--claims_recoverable_revenue_code
+			--remove duplicated values
+			SELECT ARRAY(SELECT DISTINCT unnest(_revenue_codes)) INTO _revenue_codes;
+			UPDATE claims_recoverable SET revenue_codes = _revenue_codes WHERE claim_recoverable_id = _claim_recoverable_id_inserted;
+ 			SELECT claim_recoverable_revenue_code_insert(_claim_recoverable_id_inserted, _revenue_codes) INTO _claim_recoverable_revenue_code_id;
+	
+ 			--claims_recoverable_tags
+			SELECT ARRAY(SELECT jsonb_array_elements_text(_data->'tags')) INTO _claims_tag;
+			SELECT claim_recoverable_tags_insert(_claim_recoverable_id_inserted, _claims_tag) INTO _claim_recoverable_tags_id;
+		END IF;
+
+	-- Journal(debug)
+	SELECT _journal_data || jsonb_build_object('claims_recoverable_id', -1*_claim_recoverable_id_inserted )
+	INTO _journal_data;
+
+	insert into claims_recoverable_journal("claims_recoverable_id", "user_email", "_data")
+	values(_claim_recoverable_id_inserted, _user_email, _journal_data);
+
+	RETURN _claim_recoverable_id_inserted;
+	END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_insert_api(text);
+CREATE OR REPLACE FUNCTION claims_recoverable_insert_api(encodedata text)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+    inserted_account_number text;
+      begin	      
+      	select claims_recoverable_insert(cast(convert_from(decode(encodeData, 'base64'), 'UTF8') as JSONB)) INTO inserted_account_number;
+		RETURN inserted_account_number;
+      END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_payer_nm109_update();
+CREATE OR REPLACE FUNCTION claims_recoverable_payer_nm109_update()
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_row_updated int4;
+	begin
+		_row_updated = 0;
+
+		UPDATE claims_recoverable cr
+		SET payer_nm109 = (convert_from(decode(e.loop2000b, 'base64'), 'UTF8')::JSONB->>'loop2010bb')::JSONB->>'nm109'
+		FROM claims_recoverable cr2 
+		JOIN sub_providers sp ON cr2.sub_provider_id = sp.id 
+		JOIN providers p ON sp.provider_id = p.id
+		JOIN edi837 e ON cr2.account_number = e.account_number and cr2.clm01 = e.clm01
+		WHERE 
+			cr.id = cr2.id AND 
+			p."name" = e.provider and
+			cr.claim_hash = (convert_from(decode(e.loop2000b, 'base64'), 'UTF8')::JSONB->>'loop2300')::JSONB->>'claimhash' AND
+			cr.payer_nm109 IS null;
+	
+		GET DIAGNOSTICS _row_updated = ROW_COUNT;
+		RETURN _row_updated;
+	END;
+$function$
+;
+
+
+-- DROP FUNCTION claims_recoverable_set_reviewed_status(jsonb, jsonb);
+CREATE OR REPLACE FUNCTION claims_recoverable_set_reviewed_status(_data jsonb, _user_info jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_has_permission bool;
+		_user_from jsonb;
+		_claim_recoverable jsonb;
+        _claim_recoverable_id_updated int4;
+		_result jsonb;
+		_result_comment jsonb;
+	BEGIN
+		SELECT 
+			("admin") OR (p.id IS NOT NULL),
+			jsonb_build_object(
+				'id', u.id,
+				'name', u.name,
+				'email', u.email,
+				'user_group', u.user_group
+			)
+			into _has_permission, _user_from
+		from users u
+		LEFT JOIN (
+			SELECT id, user_id
+			FROM user_provider_permissions
+			WHERE provider_id = CAST(_data->>'provider_id' AS INT)
+		) p
+			ON u.id = p.user_id
+		where 
+			upper(u.email) = upper(_user_info->>'email')
+            -- and (user_group is not null and user_group ? CAST(_data->>'comment_type' as TEXT))
+			and u.deleted_at is null;
+
+		
+		IF NOT _has_permission OR _has_permission IS NULL THEN 
+			SELECT jsonb_build_object(
+				'status_code', -401,
+				'user_email', _user_info->'email',
+				'message', 'User has no permission.'
+			) INTO _result;
+			RETURN _result;
+		END IF;		
+
+		SELECT 
+            jsonb_build_object(
+                'id', cr.id,
+                'status_id', cr.status_id,
+                'user_id', u.id,
+                'user_name', u.name
+            ) into _claim_recoverable
+        from claims_recoverable cr
+        left join users u on u.id = cr.user_fixer_id
+        where cr.id = CAST(_data->>'claim_recoverable_id' AS INT);
+
+		IF _claim_recoverable IS NULL THEN
+			SELECT jsonb_build_object(
+				'status_code', -404,
+				'user_email', _user_info->'email',
+				'message', 'Claim does not exist.'
+			) INTO _result;
+			RETURN _result;
+		END IF;
+
+		UPDATE claims_recoverable
+		SET 
+			reviewed_status = CAST(_data->>'reviewed_status' AS claims_recoverable_reviewed_status),
+			reviewed_status_tags = CAST(_data->>'reviewed_status_tags' AS jsonb),
+			updated_at = now()
+		WHERE id = CAST(_data->>'claim_recoverable_id' AS INT)
+		RETURNING id INTO _claim_recoverable_id_updated;
+
+		IF _claim_recoverable_id_updated IS NULL THEN
+			SELECT jsonb_build_object(
+				'status_code', -404,
+				'user_email', _user_info->'email',
+				'message', 'Claim was not updated.'
+			) INTO _result;
+			RETURN _result;
+		END IF;
+
+        IF 
+			(_data->>'comment' IS NOT NULL) 
+		AND (_data->>'comment_type' IS NOT NULL)
+		AND (_user_from->>'user_group' IS NOT NULL AND ((_user_from->>'user_group')::jsonb ? cast(_data->>'comment_type' as TEXT)) ) THEN
+            SELECT claims_recoverable_comments_insert(
+                jsonb_build_object(
+                    'claim_recoverable_id', _claim_recoverable->'id',
+                    'claim_status_id', _claim_recoverable->'status_id',
+                    'comment', concat_ws(
+						'' 
+						, '<div class="mb-2"><p class="mb-2">'
+						, _user_from->>'name'
+						, ' change reviewed status to <strong>'
+						, CAST(_data->>'reviewed_status' AS TEXT)
+						, (SELECT ' (' || string_agg(value, ', ') || ') ' FROM jsonb_array_elements_text(_data->'reviewed_status_tags'))
+						, '</strong>.</p><hr></div>'
+						, _data->>'comment'
+					),
+                    'comment_type', _data->>'comment_type',
+                    'extra_params', '{}'
+                ),
+                _user_info
+            ) INTO _result_comment;
+        END IF;
+
+		SELECT jsonb_build_object(
+			'status_code', 200,
+			'user_email', _user_info->'email',
+			'claim_recoverable', _claim_recoverable,
+			'comment', _result_comment
+		) INTO _result;
+		
+		RETURN _result;
+    END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_status_insert(jsonb);
+CREATE OR REPLACE FUNCTION claims_recoverable_status_insert(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_status_id int4;
+	begin
+		
+		select id INTO _status_id
+		from claims_recoverable_status 
+		where UPPER(name) = UPPER(_data->>'name');
+	
+		IF _status_id IS NULL THEN 
+			INSERT INTO claims_recoverable_status (
+			name
+		)
+			VALUES (
+				_data->>'name'
+			)
+			RETURNING id INTO _status_id;
+		END IF;
+		
+		
+	RETURN _status_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_type_insert(jsonb);
+CREATE OR REPLACE FUNCTION claims_recoverable_type_insert(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		inserted_id int4;
+		_type_name text;
+	begin
+		
+		SELECT COALESCE(UPPER(_data->>'type_name'), 'UNDEFINED') INTO _type_name;
+
+		select id INTO inserted_id
+		from claims_recoverable_type
+		where UPPER(name) = _type_name;
+	
+		IF inserted_id IS NULL THEN 
+			INSERT INTO claims_recoverable_type (
+				name
+			)
+			VALUES (
+				_type_name
+			)
+			RETURNING id INTO inserted_id;
+		END IF;
+		
+		
+	RETURN inserted_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_update_attachment(int4, int8, text);
+CREATE OR REPLACE FUNCTION claims_recoverable_update_attachment(_id integer, _attahcment_id bigint, _user_email text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		id_updated int8;
+	begin
+		update claims_recoverable
+		set
+			attahcment_id = _attahcment_id, updated_at = now()
+		where
+			id = _id
+			and status_id in (select id from claims_recoverable_status where name in ('OPENED', 'TO_VALIDATE', 'READY', 'ATTACHMENTS_WAITING_TR', 'ATTACHMENTS_WAITING_DELIVERY', 'QA', 'QA_PRE_CLIENT', 'QA_PRE_CLIENT_REJECTED', 'QA_CLIENT', 'QA_REJECTED', 'QA_CLIENT_IN_ANALYSIS', 'QA_CLIENT_REJECTED', 'QA_CLIENT_APPROVED', 'QA_CLIENT_FURTHER'))
+		returning id into id_updated;
+		RETURN id_updated;
+	END
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_update_info(int4, numeric, jsonb, jsonb, text);
+CREATE OR REPLACE FUNCTION claims_recoverable_update_info(_id integer, _total_reason_amount numeric, _reason_code jsonb, _rarcs jsonb, _user_email text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		id_updated int4;
+	begin
+		update claims_recoverable
+		set
+			total_reason_amount = _total_reason_amount, 
+			reason_code = _reason_code,
+			rarcs = _rarcs,
+			updated_at = now()
+		where
+			id = _id
+			and status_id in (select id from claims_recoverable_status where name in ('OPENED', 'TO_VALIDATE', 'READY', 'ATTACHMENTS_WAITING_TR', 'ATTACHMENTS_WAITING_DELIVERY', 'QA', 'QA_PRE_CLIENT', 'QA_PRE_CLIENT_REJECTED', 'QA_CLIENT', 'QA_REJECTED', 'QA_CLIENT_IN_ANALYSIS', 'QA_CLIENT_REJECTED', 'QA_CLIENT_APPROVED', 'QA_CLIENT_FURTHER'))
+		returning id into id_updated;
+		RETURN id_updated;
+	END
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_update_status(int4, int4);
+CREATE OR REPLACE FUNCTION claims_recoverable_update_status(_id integer, _status_id integer)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		id_updated int4;
+	begin
+		update claims_recoverable
+		set
+			status_id = _status_id, updated_at = now()
+		where
+			id = _id
+			and status_id in (select id from claims_recoverable_status where name in ('OPENED', 'TO_VALIDATE', 'READY', 'ATTACHMENTS_WAITING_TR', 'ATTACHMENTS_WAITING_DELIVERY', 'PROCESSING', 'CALL_TO_PAYER', 'QA', 'QA_PRE_CLIENT', 'QA_PRE_CLIENT_REJECTED', 'QA_CLIENT', 'QA_REJECTED', 'QA_CLIENT_IN_ANALYSIS', 'QA_CLIENT_REJECTED', 'QA_CLIENT_APPROVED', 'QA_CLIENT_FURTHER'))
+		returning id into id_updated;
+		RETURN id_updated;
+	END
+$function$
+;
+
+-- DROP FUNCTION claims_recoverable_user_fixer_id_update(jsonb, jsonb);
+CREATE OR REPLACE FUNCTION claims_recoverable_user_fixer_id_update(_data jsonb, _user_info jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_has_permission bool;
+		_user_from jsonb;
+		_user_to jsonb;
+		_user_to_id_updated int4;
+		_claim_recoverable jsonb;
+        _claim_recoverable_id_updated int4;
+		_result jsonb;
+		_result_comment jsonb;
+	BEGIN
+		SELECT 
+			("admin") OR (p.id IS NOT NULL),
+			jsonb_build_object(
+				'id', u.id,
+				'name', u.name,
+				'email', u.email,
+				'user_group', u.user_group
+			)
+			into _has_permission, _user_from
+		from users u
+		LEFT JOIN (
+			SELECT id, user_id
+			FROM user_provider_permissions
+			WHERE provider_id = CAST(_data->>'provider_id' AS INT)
+		) p
+			ON u.id = p.user_id
+		where 
+			upper(u.email) = upper(_user_info->>'email')
+            -- and (user_group is not null and user_group ? CAST(_data->>'comment_type' as TEXT))
+			and u.deleted_at is null;
+
+		
+		IF NOT _has_permission OR _has_permission IS NULL THEN 
+			SELECT jsonb_build_object(
+				'status_code', -401,
+				'user_email', _user_info->'email',
+				'message', 'User has no permission.'
+			) INTO _result;
+			RETURN _result;
+		END IF;		
+
+		SELECT jsonb_build_object('id', id, 'name', name) into _user_to from users u where id = CAST(_data->>'user_fixer_id' AS INT) and deleted_at is NULL;
+		SELECT 
+            jsonb_build_object(
+                'id', cr.id,
+                'status_id', cr.status_id,
+                'user_id', u.id,
+                'user_name', u.name
+            ) into _claim_recoverable
+        from claims_recoverable cr
+        left join users u on u.id = cr.user_fixer_id
+        where cr.id = CAST(_data->>'claim_recoverable_id' AS INT);
+
+		IF _user_to IS NULL OR _claim_recoverable IS NULL THEN
+			SELECT jsonb_build_object(
+				'status_code', -404,
+				'user_email', _user_info->'email',
+				'message', 'user_to or claim_recoverable does not exist.'
+			) INTO _result;
+			RETURN _result;
+		END IF;
+
+		UPDATE claims_recoverable
+		SET 
+			user_fixer_id = CAST(_data->>'user_fixer_id' AS INT),
+			updated_at = now()
+		WHERE id = CAST(_data->>'claim_recoverable_id' AS INT)
+		RETURNING id, user_fixer_id INTO _claim_recoverable_id_updated, _user_to_id_updated;
+
+		IF _claim_recoverable_id_updated IS NULL THEN
+			SELECT jsonb_build_object(
+				'status_code', -404,
+				'user_email', _user_info->'email',
+				'message', 'Claim was not updated.'
+			) INTO _result;
+			RETURN _result;
+		END IF;
+
+        IF 
+		(_user_to_id_updated IS NOT NULL) 
+		AND (_data->>'comment' IS NOT NULL) 
+		AND (_data->>'comment_type' IS NOT NULL)
+		AND (_user_from->>'user_group' IS NOT NULL AND ((_user_from->>'user_group')::jsonb ? cast(_data->>'comment_type' as TEXT)) ) THEN
+            SELECT claims_recoverable_comments_insert(
+                jsonb_build_object(
+                    'claim_recoverable_id', _claim_recoverable->'id',
+                    'claim_status_id', _claim_recoverable->'status_id',
+                    'comment', concat_ws('', '<div class="mb-2"><p class="mb-2">', _user_from->>'name', ' change owner <strong>', _claim_recoverable->>'user_name', '</strong> to <strong>', _user_to->>'name', '</strong>.</p><hr></div>', _data->>'comment'),
+                    'comment_type', _data->>'comment_type',
+                    'extra_params', '{}'
+                ),
+                _user_info
+            ) INTO _result_comment;
+        END IF;
+
+		SELECT jsonb_build_object(
+			'status_code', 200,
+			'user_email', _user_info->'email',
+			'claim_recoverable', _claim_recoverable,
+			'comment', _result_comment
+		) INTO _result;
+		
+		RETURN _result;
+    END;
+$function$
+;
+
+-- DROP FUNCTION claims_temp_meditech_transactions_insert(text, text, date);
+CREATE OR REPLACE FUNCTION claims_temp_meditech_transactions_insert(_provider text, _providermeditech text, _dt date)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_transactions_added integer;
+	begin
+		with
+			dataset AS (
+				SELECT
+					DISTINCT
+						--cr.clm01,
+						first_value(cr.clm01) over (partition BY cr.account_number ORDER BY cr.id DESC) clm01,
+						cr.account_number,
+						'' AS file_name,
+						'' AS file_hash,
+						md5(concat(
+							ct.account_number,
+							ct.transaction_number_id, 
+							ct.transaction_service_date, 
+							transaction_batch_date,
+							charge_proc_id,
+							amount,
+							insurance_id)
+						) AS claim_hash,
+						CASE WHEN cast(ct.amount as numeric) < 0 THEN '22' ELSE '1' END AS clp02,
+						cast(ct.amount as numeric) AS clp04,
+						0 AS clp05,
+						NULL AS clp07,
+						date(ct.transaction_service_date) AS bpr16,
+						date(ct.transaction_batch_date) AS date_parser,
+						CASE WHEN ct.insurance_id = 'SP' THEN 'SP' ELSE p2."name" END AS payer,
+						P."name" AS provider,
+						sp.acronym AS sub_provider,
+						cast(ct.amount as numeric) AS balance,
+						CASE
+							WHEN cast(ct.amount as numeric) < 0 THEN 'PENDING_CLAWBACK'
+							WHEN cast(ct.amount as numeric) > 0 THEN 'ACCEPTED_AND_PAID' 
+							ELSE 'DENIED' 
+						END AS status,
+						cast(ct.amount as numeric) AS balance_clp04,
+						0 AS balance_clp05,
+						'{}'::jsonb AS reason_codes
+				FROM raw.claims_transactions ct 
+				JOIN claims_recoverable cr ON ct.account_number = cr.account_number
+				JOIN batch_resubmissions br ON cr.batch_resubmissions_id = br.id 
+				JOIN sub_providers sp ON cr.sub_provider_id = sp.id
+				JOIN providers p ON sp.provider_id = p.id --AND ct.provider = p."name"
+				JOIN payers p2 ON cr.payer_id = p2.id 
+				WHERE
+					UPPER(p."name") = UPPER(_provider) AND
+					UPPER(ct.provider) = UPPER(_providerMeditech) AND
+					--((ct.provider = 'STEWARD' AND upper(_provider) = 'INSIGHT') OR ct.provider = upper(_provider)) and
+					date(ct.transaction_service_date) > br.resubmission_date AND
+					date(ct.transaction_batch_date) > br.resubmission_date AND
+					date(ct.transaction_batch_date) = _dt
+			),
+			accounts AS (
+				SELECT DISTINCT account_number 
+				FROM dataset 
+			),
+			postgres_balance AS (
+				SELECT
+					account_number,
+					sum(amount) AS amount
+				FROM (
+					-- Valores iniciais de cada account_number 
+					SELECT
+						civ.account_number,
+						initial_clp04 + initial_clp05 AS amount
+					FROM claims_initial_values civ 
+					JOIN accounts a ON civ.account_number = a.account_number
+					
+					UNION ALL
+					
+					-- O que já tem no postgres
+					SELECT 
+						cr.account_number,
+						round(coalesce(sum(r.balance_clp04), 0), 2) amount
+					FROM claims_recoverable cr 
+					JOIN sub_providers sp ON cr.sub_provider_id = sp.id 
+					JOIN providers p ON sp.provider_id = p.id
+					JOIN accounts a ON cr.account_number = a.account_number
+					left JOIN responses_835 r ON cr.id = r.claim_recoverable_id 
+					where
+						UPPER(p."name") = UPPER(_provider) AND 
+						r.date_parser <= _dt
+					GROUP BY
+						cr.account_number
+				
+					UNION ALL
+					
+					-- o que vai ser adicionado
+					SELECT
+						tr.account_number,
+						round(coalesce(sum(tr.balance_clp04), 0)::numeric, 2) amount
+					FROM temp.temporary_responses_835 tr
+					JOIN accounts a ON tr.account_number = a.account_number
+					where
+						claim_hash NOT IN (SELECT claim_hash FROM responses_835 r)
+					GROUP BY
+						tr.account_number
+				) t 
+				GROUP BY account_number
+			),
+			meditech_balance AS (
+				SELECT
+					ct.account_number,
+					sum(cast(ct.amount AS numeric)) AS amount
+				FROM raw.claims_transactions ct 
+				JOIN accounts a ON ct.account_number = a.account_number
+				where
+					--((ct.provider = 'STEWARD' AND upper(_provider) = 'INSIGHT') OR ct.provider = upper(_provider)) and
+					UPPER(ct.provider) = UPPER(_providerMeditech) AND 
+					date(ct.transaction_batch_date) <= _dt
+				GROUP BY
+					ct.account_number
+			),
+			meditech_balance_zero_current_day AS (
+				SELECT
+					account_number
+				FROM (
+					SELECT
+						account_number,
+						sum(balance_clp04) AS amount
+					FROM dataset 
+					GROUP BY
+						account_number
+				) t 
+				WHERE amount = 0
+			),
+			account_numbers_selected AS (
+				SELECT
+					mb.account_number
+				FROM meditech_balance mb
+				left JOIN postgres_balance pb ON mb.account_number = pb.account_number
+				left JOIN meditech_balance_zero_current_day z ON mb.account_number = z.account_number
+				where
+					round(mb.amount::numeric, 2) <> round(pb.amount::numeric, 2) OR z.account_number IS NOT NULL
+			)
+		INSERT INTO temp.temporary_responses_835 
+		SELECT
+			ds.clm01,
+			ds.account_number,
+			ds.file_name,
+			ds.file_hash,
+			ds.claim_hash,
+			ds.clp02,
+			ds.clp04,
+			ds.clp05,
+			ds.clp07,
+			ds.bpr16,
+			ds.date_parser,
+			ds.payer,
+			ds.provider,
+			ds.sub_provider,
+			ds.balance,
+			ds.status,
+			ds.balance_clp04,
+			ds.balance_clp05,
+			ds.reason_codes
+		FROM dataset ds
+		JOIN account_numbers_selected ans ON ds.account_number = ans.account_number
+		LEFT JOIN temp.temporary_responses_835 tr ON ds.account_number = tr.account_number AND ds.bpr16 = tr.bpr16 AND ds.balance_clp04 = tr.balance_clp04
+		WHERE tr.account_number IS NULL;
+
+		GET DIAGNOSTICS _transactions_added = ROW_COUNT;
+
+		RETURN _transactions_added;
+  	END;
+$function$
+;
+
+-- DROP FUNCTION claims_temp_responses_835_insert(text, text, date);
+CREATE OR REPLACE FUNCTION claims_temp_responses_835_insert(_provider text, _provideredi text, _dt date)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_responses_added integer;
+	begin
+		with
+			day_select as (
+				select
+					id,
+					clm01,
+					account_number,
+					provider,
+					sub_provider,
+					batch_resubmissions_id,
+					resubmission_date
+				from (
+					select
+						cr.id,
+						cr.clm01,
+						cr.account_number,
+						p.name as provider,
+						sp.acronym as sub_provider,
+						cr.batch_resubmissions_id,
+						br.resubmission_date,
+						row_number() over (partition by cr.account_number order by cr.id desc) idx
+					from claims_recoverable cr
+					join sub_providers sp on cr.sub_provider_id = sp.id
+					join providers p on sp.provider_id = p.id
+					join edi835 e on 
+						cr.account_number = e.account_number and 
+						e.provider = UPPER(_providerEDI)
+					left join batch_resubmissions br on cr.batch_resubmissions_id = br.id
+					where
+						date(e.date_parser) = _dt and
+						e.provider = UPPER(_providerEDI)
+					and
+						-- cr.batch_resubmissions_id is not null
+						cast(e.bpr16 as date) >= br.resubmission_date
+				) t
+				where idx = 1 
+				and provider = upper(_provider) --novo
+			),
+			dataset as (
+				select
+					ds.id,
+					ds.clm01,
+					ds.account_number,
+					ds.provider,
+					ds.sub_provider,
+					e.file_name,
+					e.file_hash,
+					cast(e.date_parser as date) as date_parser,
+					cast(e.bpr16 as date) as bpr16,
+					convert_from(decode(loop2000, 'base64'), 'UTF8')::JSONB->>'loop2100' loop2100,
+					convert_from(decode(loop1000a, 'base64'), 'UTF8')::JSONB->>'n102' as payer,
+					row_number() over (partition by e.account_number, e.file_hash order by e.date_parser desc) as idx_responses,
+					ds.resubmission_date
+				from day_select ds
+				join edi835 e on 
+					ds.account_number = e.account_number and 
+					e.provider = UPPER(_providerEDI)
+				where
+					date(e.date_parser) = _dt
+			),
+			t as (
+				select
+					idx_responses,
+					account_number,
+					loop2100::JSONB->>'claimhash' claim_hash,
+					jsonb_array_elements((jsonb_array_elements(((loop2100::JSONB->>'loop2110')::JSONB)::jsonb)->>'cas')::jsonb) as reasons
+				from dataset
+			),
+			reasons as (
+				select
+					idx_responses,
+					account_number,
+					claim_hash,
+					group_code,
+					(array_agg(elem_value ORDER BY inside_array_order))[1] as reason_code,
+					(array_agg(elem_value ORDER BY inside_array_order))[2] as reason_amount
+				FROM (
+					select
+						idx_responses,
+						idx,
+						account_number,
+						claim_hash,
+						elem_value,
+						group_code,
+						floor((elem_order - 2)/3) inside_array_index,
+						floor((elem_order - 2)%3) inside_array_order
+					FROM (
+						select
+							idx_responses,
+							idx,
+							account_number,
+							claim_hash,
+							reasons,
+							trim(reasons[0]::TEXT, '"') group_code,
+							(array_agg(reasons))[1] reason_arr
+						FROM (
+							select
+								idx_responses,
+								ROW_NUMBER() OVER() idx,
+								account_number,
+								claim_hash,
+								reasons
+							from t
+						) t
+						GROUP by
+							idx_responses,
+							idx,
+							account_number,
+							claim_hash,
+							reasons
+					) t1,
+					jsonb_array_elements_text(t1.reason_arr) WITH ORDINALITY AS json_elements(elem_value, elem_order)
+				) t2
+				WHERE inside_array_order >= 0
+				GROUP by
+					idx_responses,
+					idx,
+					account_number,
+					claim_hash,
+					group_code,
+					inside_array_index
+			),
+			reasons_denied as (
+				select
+					idx_responses,
+					account_number,
+					claim_hash,
+					jsonb_agg(reasons) as reason_codes
+				from (
+					select
+						idx_responses,
+						account_number,
+						claim_hash,
+						jsonb_build_object(
+							'group_code', group_code,
+							'reason_code', reason_code,
+							'reason_amount', sum(reason_amount::numeric)
+						) as reasons
+					from reasons
+					where
+						group_code <> 'PR'
+					group by
+						idx_responses,
+						account_number,
+						claim_hash,
+						group_code,
+						reason_code
+				) t
+				group by
+					idx_responses,
+					account_number,
+					claim_hash
+			),
+			balance_clp05 as (
+				select
+					idx_responses,
+					account_number,
+					group_code,
+					sum(reason_amount::numeric) as patient_amount
+				from reasons
+				where
+					group_code = 'PR' and reason_code in ('3')
+				group by
+					idx_responses,
+					account_number,
+					group_code
+			),
+			final_responses as (
+				select
+					id,
+					clm01,
+					account_number,
+					file_name,
+					file_hash,
+					date_parser,
+					resubmission_date,
+					bpr16,
+					loop2100::JSONB->>'claimhash' claim_hash,
+					cast(loop2100::JSONB->>'clp04' as numeric) clp04,
+					case when loop2100::JSONB->>'clp05' = '' then 0 else cast(loop2100::JSONB->>'clp05' as numeric) end as clp05,
+					loop2100::JSONB->>'clp07' clp07,
+					provider,
+					sub_provider,
+					payer,
+					loop2100::JSONB->>'clp02' clp02,
+					-- row_number() over (partition by account_number order by date_parser, loop2100::JSONB->>'clp02' desc) as idx,
+					-- count(1) over (partition by account_number) as countlines,
+					idx_responses
+				from dataset
+			)
+		insert into temp.temporary_responses_835
+		select
+			clm01,
+			account_number,
+			file_name,
+			file_hash,
+			claim_hash,
+			clp02,
+			clp04,
+			clp05,
+			clp07,
+			bpr16,
+			date_parser,
+			payer,
+			provider,
+			sub_provider,
+			balance,
+			status,
+			balance_clp04,
+			balance_clp05,
+			reason_codes
+		from (
+			select
+				clm01,
+				f.account_number,
+				file_name,
+				file_hash,
+				f.claim_hash,
+				clp02,
+				clp04,
+				clp05,
+				clp07,
+				bpr16,
+				date_parser,
+				payer,
+				provider,
+				sub_provider,
+				(clp04 + coalesce(b05.patient_amount, 0)) as balance,
+				CASE
+					WHEN clp02 = '4' THEN 'DENIED'
+					WHEN clp02 = '22' THEN 'PENDING_CLAWBACK'
+					WHEN EXISTS (
+						SELECT 1
+						FROM reasons r
+						WHERE r.account_number = f.account_number and r.claim_hash = f.claim_hash
+						AND (group_code = 'CO' and reason_code = '29')
+					) THEN 'EXPIRED'
+					WHEN clp04 > 0 THEN 'ACCEPTED_AND_PAID'
+					WHEN coalesce(b05.patient_amount, 0) > 0 THEN 'ACCEPTED_AND_ADJUSTED_PR'
+					ELSE 'DENIED'
+				END AS status,
+				clp04 as balance_clp04,
+				coalesce(b05.patient_amount, 0) as balance_clp05,
+				rd.reason_codes,
+				row_number() over(partition by f.claim_hash) idx
+			from final_responses f
+			left join balance_clp05 b05 on f.account_number = b05.account_number and f.idx_responses = b05.idx_responses
+			left join reasons_denied rd on f.account_number = rd.account_number and f.claim_hash = rd.claim_hash and f.idx_responses = rd.idx_responses
+			where
+				-- not (clp02 = '1' and clp04 = '0' and idx <> countlines) and
+				not (clp02 ='22' and clp04 = '0' and coalesce(b05.patient_amount, 0) = 0) and
+				not (clp02 in ('23', '25')) -- Not Our Claim and No Payment
+		) t
+		where
+			idx = 1
+		order by
+			clm01,
+			date_parser,
+			clp02 desc,
+			clp04;
+
+		GET DIAGNOSTICS _responses_added = ROW_COUNT;
+
+		RETURN _responses_added;
+  	END;
+$function$
+;
+
+-- DROP FUNCTION claims_temp_responses_835_insert_v2(text, date);
+CREATE OR REPLACE FUNCTION claims_temp_responses_835_insert_v2(_provider text, _dt date)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_responses_added integer;
+    	sql_query TEXT;
+		_edi_table text;
+	begin
+		 _edi_table := format('edi835_%s', _provider);
+		sql_query := format($$
+			with
+				day_select as (
+					select
+						id,
+						clm01,
+						account_number,
+						provider,
+						sub_provider,
+						batch_resubmissions_id,
+						resubmission_date
+					from (
+						select
+							cr.id,
+							cr.clm01,
+							cr.account_number,
+							p.name as provider,
+							sp.acronym as sub_provider,
+							cr.batch_resubmissions_id,
+							br.resubmission_date,
+							row_number() over (partition by cr.account_number order by cr.id desc) idx
+						from claims_recoverable cr
+						join sub_providers sp on cr.sub_provider_id = sp.id
+						join providers p on sp.provider_id = p.id
+						join %I e on 
+							cr.account_number = e.account_number and 
+							e.provider = UPPER(%L)
+						left join batch_resubmissions br on cr.batch_resubmissions_id = br.id
+						where
+							date(e.date_parser) = %L and
+							e.provider = UPPER(%L)
+						and
+							-- cr.batch_resubmissions_id is not null
+							cast(e.bpr16 as date) >= br.resubmission_date
+					) t
+					where idx = 1 
+					and provider = upper(%L) --novo
+				),
+				dataset as (
+					select
+						ds.id,
+						ds.clm01,
+						ds.account_number,
+						ds.provider,
+						ds.sub_provider,
+						e.file_name,
+						e.file_hash,
+						cast(e.date_parser as date) as date_parser,
+						cast(e.bpr16 as date) as bpr16,
+						convert_from(decode(loop2000, 'base64'), 'UTF8')::JSONB->>'loop2100' loop2100,
+						convert_from(decode(loop1000a, 'base64'), 'UTF8')::JSONB->>'n102' as payer,
+						row_number() over (partition by e.account_number, e.file_hash order by e.date_parser desc) as idx_responses,
+						ds.resubmission_date
+					from day_select ds
+					join %I e on 
+						ds.account_number = e.account_number and 
+						e.provider = UPPER(%L)
+					where
+						date(e.date_parser) = %L
+				),
+				t as (
+					select
+						idx_responses,
+						account_number,
+						loop2100::JSONB->>'claimhash' claim_hash,
+						jsonb_array_elements((jsonb_array_elements(((loop2100::JSONB->>'loop2110')::JSONB)::jsonb)->>'cas')::jsonb) as reasons
+					from dataset
+				),
+				reasons as (
+					select
+						idx_responses,
+						account_number,
+						claim_hash,
+						group_code,
+						(array_agg(elem_value ORDER BY inside_array_order))[1] as reason_code,
+						(array_agg(elem_value ORDER BY inside_array_order))[2] as reason_amount
+					FROM (
+						select
+							idx_responses,
+							idx,
+							account_number,
+							claim_hash,
+							elem_value,
+							group_code,
+							floor((elem_order - 2)/3) inside_array_index,
+							floor((elem_order - 2)%3) inside_array_order
+						FROM (
+							select
+								idx_responses,
+								idx,
+								account_number,
+								claim_hash,
+								reasons,
+								trim(reasons[0]::TEXT, '"') group_code,
+								(array_agg(reasons))[1] reason_arr
+							FROM (
+								select
+									idx_responses,
+									ROW_NUMBER() OVER() idx,
+									account_number,
+									claim_hash,
+									reasons
+								from t
+							) t
+							GROUP by
+								idx_responses,
+								idx,
+								account_number,
+								claim_hash,
+								reasons
+						) t1,
+						jsonb_array_elements_text(t1.reason_arr) WITH ORDINALITY AS json_elements(elem_value, elem_order)
+					) t2
+					WHERE inside_array_order >= 0
+					GROUP by
+						idx_responses,
+						idx,
+						account_number,
+						claim_hash,
+						group_code,
+						inside_array_index
+				),
+				reasons_denied as (
+					select
+						idx_responses,
+						account_number,
+						claim_hash,
+						jsonb_agg(reasons) as reason_codes
+					from (
+						select
+							idx_responses,
+							account_number,
+							claim_hash,
+							jsonb_build_object(
+								'group_code', group_code,
+								'reason_code', reason_code,
+								'reason_amount', sum(reason_amount::numeric)
+							) as reasons
+						from reasons
+						where
+							group_code <> 'PR'
+						group by
+							idx_responses,
+							account_number,
+							claim_hash,
+							group_code,
+							reason_code
+					) t
+					group by
+						idx_responses,
+						account_number,
+						claim_hash
+				),
+				balance_clp05 as (
+					select
+						idx_responses,
+						account_number,
+						group_code,
+						sum(reason_amount::numeric) as patient_amount
+					from reasons
+					where
+						group_code = 'PR' and reason_code in ('3')
+					group by
+						idx_responses,
+						account_number,
+						group_code
+				),
+				final_responses as (
+					select
+						id,
+						clm01,
+						account_number,
+						file_name,
+						file_hash,
+						date_parser,
+						resubmission_date,
+						bpr16,
+						loop2100::JSONB->>'claimhash' claim_hash,
+						cast(loop2100::JSONB->>'clp04' as numeric) clp04,
+						case when loop2100::JSONB->>'clp05' = '' then 0 else cast(loop2100::JSONB->>'clp05' as numeric) end as clp05,
+						loop2100::JSONB->>'clp07' clp07,
+						provider,
+						sub_provider,
+						payer,
+						loop2100::JSONB->>'clp02' clp02,
+						-- row_number() over (partition by account_number order by date_parser, loop2100::JSONB->>'clp02' desc) as idx,
+						-- count(1) over (partition by account_number) as countlines,
+						idx_responses
+					from dataset
+				)
+			insert into temp.temporary_responses_835
+			select
+				clm01,
+				account_number,
+				file_name,
+				file_hash,
+				claim_hash,
+				clp02,
+				clp04,
+				clp05,
+				clp07,
+				bpr16,
+				date_parser,
+				payer,
+				provider,
+				sub_provider,
+				balance,
+				status,
+				balance_clp04,
+				balance_clp05,
+				reason_codes
+			from (
+				select
+					clm01,
+					f.account_number,
+					file_name,
+					file_hash,
+					f.claim_hash,
+					clp02,
+					clp04,
+					clp05,
+					clp07,
+					bpr16,
+					date_parser,
+					payer,
+					provider,
+					sub_provider,
+					(clp04 + coalesce(b05.patient_amount, 0)) as balance,
+					CASE
+						WHEN clp02 = '4' THEN 'DENIED'
+						WHEN clp02 = '22' THEN 'PENDING_CLAWBACK'
+						WHEN EXISTS (
+							SELECT 1
+							FROM reasons r
+							WHERE r.account_number = f.account_number and r.claim_hash = f.claim_hash
+							AND (group_code = 'CO' and reason_code = '29')
+						) THEN 'EXPIRED'
+						WHEN clp04 > 0 THEN 'ACCEPTED_AND_PAID'
+						WHEN coalesce(b05.patient_amount, 0) > 0 THEN 'ACCEPTED_AND_ADJUSTED_PR'
+						ELSE 'DENIED'
+					END AS status,
+					clp04 as balance_clp04,
+					coalesce(b05.patient_amount, 0) as balance_clp05,
+					rd.reason_codes,
+					row_number() over(partition by f.claim_hash) idx
+				from final_responses f
+				left join balance_clp05 b05 on f.account_number = b05.account_number and f.idx_responses = b05.idx_responses
+				left join reasons_denied rd on f.account_number = rd.account_number and f.claim_hash = rd.claim_hash and f.idx_responses = rd.idx_responses
+				where
+					-- not (clp02 = '1' and clp04 = '0' and idx <> countlines) and
+					not (clp02 ='22' and clp04 = '0' and coalesce(b05.patient_amount, 0) = 0) and
+					not (clp02 in ('23', '25')) -- Not Our Claim and No Payment
+			) t
+			where
+				idx = 1
+			order by
+				clm01,
+				date_parser,
+				clp02 desc,
+				clp04;
+		$$, _edi_table, _provider, _dt, _provider, _provider,_edi_table, _provider, _dt);
+
+		EXECUTE sql_query;	
+	
+		GET DIAGNOSTICS _responses_added = ROW_COUNT;
+
+		RETURN _responses_added;
+  	END;
+$function$
+;
+
+-- DROP FUNCTION claims_update_status_balance(date);
+CREATE OR REPLACE FUNCTION claims_update_status_balance(_date date)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+   id_atual int;
+   _status_id int;
+   _balance numeric;
+   _account_number text;
+   _clm01 text;
+   _provider_id int;
+   _sub_provider_id int;
+   ids_update int[] := '{}';
+   _temp jsonb:= '[]'::jsonb;
+   _final jsonb[] := '{}';
+BEGIN
+    -- Obter todos os IDs para atualização
+    SELECT array_agg(r.claim_recoverable_id) INTO ids_update
+    FROM responses_835 r
+    WHERE r.date_parser = _date
+    GROUP BY r.claim_recoverable_id;
+
+    -- Executar loop para cada ID
+    IF (ids_update IS NOT NULL) THEN
+        FOREACH id_atual IN ARRAY ids_update
+        LOOP
+            WITH data AS (
+                SELECT cr.account_number,
+                       r.status_id,
+                       cr.sub_provider_id,
+                       sp.provider_id,
+                       cr.clm01,
+                       SUM(r.balance_clp04) OVER (PARTITION BY cr.account_number) balance_clp04,
+                       SUM(r.balance_clp05) OVER (PARTITION BY cr.account_number) AS balance_clp05,
+                       ROW_NUMBER() OVER (PARTITION BY cr.account_number ORDER BY r.id DESC) AS idx
+                FROM claims_recoverable cr
+                JOIN responses_835 r ON cr.id = r.claim_recoverable_id
+                JOIN sub_providers sp ON cr.sub_provider_id = sp.id
+                WHERE cr.id = id_atual
+            )
+            SELECT (balance_clp04 + balance_clp05), status_id, provider_id, account_number, clm01
+            INTO _balance, _status_id, _provider_id, _account_number, _clm01
+            FROM data 
+            WHERE idx = 1;
+            -- Adicionar resultado ao JSON final
+           _temp := _temp || jsonb_build_object(
+                'id', id_atual,
+                'balance', _balance,
+                'status_id', _status_id,
+                'provider_id', _provider_id,
+                'account_number', _account_number,
+                'clm01', _clm01,
+                'resultado', 'sucesso'
+            );
+           _final:= array[_temp];
+        END LOOP;
+    END IF;
+
+    RETURN _temp;
+END
+$function$
+;
+
+-- DROP FUNCTION clm01_generator(jsonb, text);
+CREATE OR REPLACE FUNCTION clm01_generator(_data jsonb, _user_email text)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_clm01_original TEXT;
+		_clm01_generated TEXT;
+		_used_generated_clm01 TEXT;
+
+		_success_generate bool := false;
+		_sequence_last_value int8;
+		_blacklisted bool := false;
+		_check_recoverable bool := false;
+		_check_clm01_already_on_history bool := false;
+		
+		_provider_prefix TEXT;
+		_new_prefix TEXT;
+		_new_number INT4;
+		_seq_real_valor INT8;
+		_seq_name TEXT;
+		_provider_prefix_history TEXT[];
+
+		_provider_id INT4;
+		_has_permission bool;
+		_max_retries int4;
+	
+		_create_seq_query TEXT;
+	BEGIN
+		
+	SELECT FALSE INTO _success_generate;
+
+	-- Check clm01 already requested and generated
+	SELECT generated_clm01, p.id, clm01, concat('provider_', p.id)
+		INTO _used_generated_clm01, _provider_id, _clm01_original, _seq_name
+	FROM CLAIMS_RECOVERABLE CR
+	LEFT JOIN SUB_PROVIDERS SP 
+		ON sp.id = cr.sub_provider_id
+	LEFT JOIN PROVIDERS p
+		ON p.id = sp.provider_id 
+	WHERE cr.id = CAST(_data->>'claims_recoverable_id' AS INT4);
+	
+	IF _used_generated_clm01 IS NOT NULL THEN
+		RETURN '-409';
+	END IF;
+	-- Check clm01 already requested and generated
+
+	-- Check user Permission
+	SELECT upp.id > 0 OR u.ADMIN INTO _has_permission
+	FROM users u
+	LEFT JOIN user_provider_permissions upp
+		ON 
+			upp.user_id = u.id AND
+			upp.provider_id = _provider_id
+	WHERE UPPER(u."email") = UPPER(_user_email);
+
+	IF(_has_permission IS NULL) THEN
+		RETURN -401;
+	END IF;
+	-- Check user Permission
+
+	-- Get Sequence
+	SELECT LPAD(CAST(COALESCE("last_value", "start_value") AS TEXT), 14, '0') INTO _sequence_last_value
+	FROM PG_CATALOG.PG_SEQUENCES
+	WHERE SEQUENCENAME = _seq_name;
+
+	IF _sequence_last_value IS NULL THEN
+		return -404;
+	END IF;
+	-- Check Sequence
+
+	-- Check clm01 prefix
+	SELECT prefix 
+		, history 
+		, COALESCE (ARRAY_LENGTH(history, 1), 0) + 1
+	INTO _provider_prefix
+		, _provider_prefix_history
+		, _max_retries
+	FROM clm01_prefix C
+	WHERE provider_id = _provider_id
+	ORDER BY created_at DESC
+	LIMIT 1;
+
+	IF _provider_prefix is null 
+	THEN
+		INSERT INTO clm01_prefix (prefix, provider_id)
+		SELECT decimal_to_ascii(cast(SUBSTRING(CAST(_sequence_last_value AS TEXT), 1, 5) AS int4)) current_prefix
+			, _provider_id;
+
+		SELECT 1 INTO _max_retries;
+	END IF;
+	-- Check clm01 prefix
+
+	WHILE ( _max_retries >= 0 AND not _success_generate) LOOP
+		RAISE NOTICE '# looping _max_retries: %', _max_retries;
+
+		SELECT base_26, next_val , seq_real_valor INTO
+			_new_prefix, _new_number, _seq_real_valor
+		FROM (
+			SELECT decimal_to_ascii(SUBSTRING(seq_number, 1, 5)::int) base_26
+				, LPAD( SUBSTRING(seq_number, 6, 14), 9, '0' ) next_val
+				, cast(seq_number AS int8) seq_real_valor
+			FROM (
+				SELECT lpad(cast(NEXTVAL(_seq_name)  AS text), 14, '0' ) AS seq_number
+			) AS gen
+		) gen;
+
+
+		RAISE NOTICE '# _new_number: %', _new_number;
+		-- Check if is a new letter
+		IF _new_number = 0 THEN
+			
+			-- Check if new_prefix already exists on history
+			SELECT _new_prefix = any(cp.history) INTO _blacklisted
+			FROM clm01_prefix cp
+			WHERE cp.provider_id = _provider_id;
+			-- Check if new_prefix already exists on history
+			
+			-- Update Sequence to bypass blacklisted prefix
+			IF _blacklisted THEN
+				RAISE NOTICE '#1 _seq_real_valor: %', _seq_real_valor;
+				SELECT setval(_seq_name, new_seq_number, FALSE) INTO _seq_real_valor
+				FROM (
+					SELECT CAST(
+								CONCAT(
+										LPAD(
+											CAST(1 + CAST( SUBSTRING(seq_number, 1, 5) AS int4 ) AS text), -- Jump to next letter
+											5,
+											'0'
+										),
+										'000000000' -- prefix number part
+								)
+								AS INT8
+						) new_seq_number
+					FROM (
+						SELECT lpad(CAST(_seq_real_valor AS text), 14, '0') seq_number
+					) b
+				) a;
+
+				RAISE NOTICE '#2 _seq_real_valor: %', _seq_real_valor;
+
+			END IF;
+			-- Update Sequence to bypass blacklisted prefix
+		
+		ELSE
+			-- Success
+			SELECT TRUE , CONCAT( _new_prefix, LPAD(cast(_new_number as text), 9, '0') ) INTO 
+				_success_generate, _clm01_generated;
+			-- Success
+		END IF;
+		-- Check if is a new letter
+		SELECT _max_retries - 1 INTO _max_retries;
+	END LOOP;
+
+	-- Avoid duplicate itens on history array
+	IF _provider_prefix != _new_prefix THEN
+
+		-- Check history
+		SELECT _provider_prefix = any(history) INTO _check_clm01_already_on_history
+		FROM CLM01_PREFIX
+		WHERE provider_id = _provider_id
+		ORDER BY created_at DESC
+		LIMIT 1;
+		-- Check history
+	
+		-- Update CLM01_PREFIX
+		IF _check_clm01_already_on_history THEN
+			-- Don't append to blacklist
+			UPDATE
+				CLM01_PREFIX c
+			SET
+				PREFIX = _new_prefix,
+				updated_at = now()
+			FROM
+				CLM01_PREFIX cp
+			WHERE
+				current.provider_id = _provider_id;
+		ELSE
+			-- Append to blacklist
+			UPDATE
+				CLM01_PREFIX current
+			SET
+				PREFIX = _new_prefix,
+				HISTORY = current.history || _provider_prefix::text,
+				updated_at = now()
+			FROM
+				CLM01_PREFIX cp
+			WHERE
+				current.provider_id = _provider_id;
+		END IF;
+		-- Update CLM01_PREFIX
+	
+	END IF;
+	-- Avoid duplicate itens on history array
+
+	-- Update CLAIMS_RECOVERABLE
+	UPDATE 
+		CLAIMS_RECOVERABLE
+	SET
+		GENERATED_CLM01 = _clm01_generated
+	WHERE id = cast(_data->>'claims_recoverable_id' as int4);
+	-- Update CLAIMS_RECOVERABLE
+
+	-- Insert clm01_log
+		INSERT INTO clm01_log (
+			provider_id,
+			clm01_original,
+			clm01_generated,
+			c1,
+			c2,
+			c3,
+			num
+		)
+		VALUES (
+			_provider_id,
+			_clm01_original,
+			_clm01_generated,
+			substring(_clm01_generated, 1, 1),
+			substring(_clm01_generated, 2, 1),
+			substring(_clm01_generated, 3, 1),
+			_new_number
+		);
+	-- Insert clm01_log
+
+	RETURN _clm01_generated;
+	END;
+$function$
+;
+
+-- DROP FUNCTION clm01_prefix_insert(jsonb);
+CREATE OR REPLACE FUNCTION clm01_prefix_insert(_data jsonb)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    _inital_sequence_value int8;
+    _create_seq_query text;
+    _seq_name text;
+
+    _sequence_exists bool := false;
+BEGIN
+
+    SELECT seq_name INTO _seq_name
+    FROM clm01_prefix
+    where provider_id = cast(_data->>'provider_id' as int4);
+
+    -- Check if exists
+    IF _seq_name IS NULL THEN
+        INSERT INTO clm01_prefix( 
+            provider_id,
+            prefix
+        ) VALUES (
+            CAST(_data->>'provider_id' AS int4),
+            _data->>'prefix'
+        ) RETURNING seq_name INTO _seq_name;
+    ELSE
+        RAISE NOTICE 'Seq Name';
+        RETURN -409;
+    END IF;
+
+    SELECT true INTO _sequence_exists
+    FROM PG_CATALOG.PG_SEQUENCES
+    WHERE SEQUENCENAME = _seq_name;
+
+    IF _sequence_exists THEN
+        RAISE NOTICE 'Seq Exists';
+        RETURN -409;
+    END IF;
+
+    SELECT CAST(
+        CONCAT(
+            LPAD(
+                CAST(b10.c1 + b10.c2 + b10.c3 AS text), -- prefix parsed to number
+                5,
+                '0'
+            ),
+            LPAD('1', 9, '0') -- prefix number part
+        )
+        AS INT8
+    ) INTO _inital_sequence_value
+    FROM (
+        SELECT power(26, 2) * b26.c1 AS c1,
+            power(26, 1) * b26.c2 AS c2, 
+            power(26, 0) * b26.c3 AS c3
+        FROM (
+            SELECT ascii(asc_ii.C1) - 64 c1,
+                ascii(asc_ii.C2) - 64 c2,
+                ascii(asc_ii.C3) - 65 c3
+            FROM (
+                SELECT substring(initial_prefix, 1, 1) C1 ,
+                    substring(initial_prefix, 2, 1) C2,
+                    substring(initial_prefix, 3, 1) C3
+                FROM (
+                    SELECT _data->>'prefix' initial_prefix
+                ) initial_prefix
+            ) asc_ii
+        ) b26
+    ) b10;
+
+    IF _sequence_exists IS NULL THEN
+        _create_seq_query := 'CREATE SEQUENCE IF NOT EXISTS ' || _seq_name || ' AS int8 ' ||
+        'INCREMENT BY 1 ' || 
+        'START WITH ' || _inital_sequence_value || ' ' ||
+        'MINVALUE 00702000000001 ' ||
+        'MAXVALUE 18277999999999 ' ||
+        'CYCLE';
+        EXECUTE _create_seq_query;
+    END IF;
+
+    RETURN _seq_name;
+	END;
+$function$
+;
+
+-- DROP FUNCTION decimal_to_ascii(int4);
+CREATE OR REPLACE FUNCTION decimal_to_ascii(decimal_number integer)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    result text := '';
+    base26_value int;
+BEGIN
+    IF decimal_number < 702 THEN
+        RETURN 'Invalid input. Lower then 702(AAA)';
+    END IF;
+   
+	decimal_number:=decimal_number+1;
+
+    WHILE decimal_number > 0 LOOP
+        base26_value := (decimal_number - 1) % 26;
+        result := chr(base26_value + 1 + 64) || result;
+        decimal_number := (decimal_number - base26_value - 1) / 26::int;
+    END LOOP;
+
+    RETURN RESULT;
+END;
+$function$
+;
+
+-- DROP FUNCTION invoices_insert(text, text);
+CREATE OR REPLACE FUNCTION invoices_insert(_yearmonth text, _provider text)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    row_count INTEGER :=0;
+    insert_count INTEGER := 0;
+BEGIN
+	SELECT COUNT(*) INTO row_count
+    FROM invoices i
+	JOIN sub_providers sp on i.sub_provider_id = sp.id
+    JOIN providers p on sp.provider_id = p.id
+    WHERE 
+		date(date_trunc('month',i.date_parser)) = date(date_trunc('month',  CONCAT(_YearMonth, '-01')::date))
+		and upper(p.name) = upper(_provider);
+	IF row_count = 0 THEN
+        WITH
+		initial_values AS (
+			-- Valor inicial de cada account_number
+			SELECT 
+					account_number, 
+					initial_clp04, 
+					initial_clp05
+			FROM claims_initial_values civ
+			JOIN providers p on civ.provider_id = p.id 
+			WHERE
+			upper(p.name) = upper(_provider)
+		), current_values AS (
+			SELECT 
+				cr.account_number,
+				SUM(r.balance_clp04) balance_clp04, 
+				SUM(r.balance_clp05 + adjustment_clp05) balance_clp05, 
+				MAX(r.date_parser) AS date_parser
+			FROM claims_recoverable cr 
+			JOIN responses_835 r ON cr.id = r.claim_recoverable_id 
+			JOIN sub_providers sp ON cr.sub_provider_id = sp.id 
+			JOIN providers p ON sp.provider_id = p.id
+			WHERE date(r.date_parser) < date(date_trunc('month', CONCAT(_YearMonth, '-01')::date) + interval '1 month')
+			AND date(r.bpr16) < date(date_trunc('month',  CONCAT(_YearMonth, '-01')::date) + interval '1 month') and 
+			upper(p.name) = upper(_provider)
+			GROUP BY cr.account_number
+		),	last_invoices AS (
+			SELECT 
+				i.account_number,
+				SUM(i.balance_payer) AS balance_payer,
+				SUM(i.balance_patient) AS balance_patient
+			FROM invoices i 
+			WHERE date(i.date_parser) < date(date_trunc('month',  CONCAT(_YearMonth, '-01')::date))
+			GROUP BY i.account_number
+		),	final AS (
+			SELECT 
+				c.account_number,
+				c.date_parser,
+				i.initial_clp04 + coalesce(l.balance_payer,0) as past_payer_recovery,
+				i.initial_clp05 + coalesce(l.balance_patient,0) as past_patient_recovery,
+				i.initial_clp04+ c.balance_clp04 as current_payer_recovery,--past initial + last_invoice
+				i.initial_clp05+ c.balance_clp05 as current_patient_recovery,
+				c.balance_clp04 - coalesce(l.balance_payer,0) as additional_payer_recovery,
+				c.balance_clp05 - coalesce(l.balance_patient,0) as additional_patient_recovery
+			FROM current_values c
+			JOIN initial_values i ON c.account_number = i.account_number
+			LEFT JOIN last_invoices l ON c.account_number = l.account_number
+			WHERE (c.balance_clp04 - coalesce(l.balance_payer,0)) <>0 OR (c.balance_clp05 - coalesce(l.balance_patient,0)) <>0
+		),	invoice AS (
+		SELECT
+			f.account_number,
+			f.past_payer_recovery,
+			f.past_patient_recovery,
+			f.current_payer_recovery,
+			f.current_patient_recovery,
+			f.additional_payer_recovery,
+			f.additional_patient_recovery,
+			CASE
+				WHEN provider_id=1 THEN sp.acronym
+				 ELSE sp.name 
+			   END AS hospital,
+			   sp.id AS sub_provider_id,
+			cr.clm01,
+			f.date_parser,
+			crt.id AS recovery_type_id,
+			crt.name AS recovery_type,
+			p2.name AS payer_name,
+			p2.id as payer_id,
+			CASE 
+				WHEN ca.account_number is NULL THEN FALSE
+			ELSE 
+				TRUE
+			END AS assigned_claim,
+			row_number() over(partition by f.account_number) AS idx
+		FROM final f
+		JOIN claims_recoverable cr ON f.account_number=cr.account_number
+		JOIN sub_providers sp ON cr.sub_provider_id = sp.id
+		JOIN providers p ON p.id = sp.provider_id
+		JOIN responses_835 r ON cr.id = r.claim_recoverable_id
+		JOIN payers p2 ON r.payer_id = p2.id
+		JOIN claims_recoverable_type crt ON cr.recoverable_type_id = crt.id
+		LEFT JOIN raw.claims_assigned ca ON f.account_number = ca.account_number
+	   ), final_invoice as( 
+		SELECT 
+			hospital,
+			sub_provider_id,
+			account_number,
+			clm01,
+			date_parser,
+			recovery_type,
+			recovery_type_id,
+			payer_id,
+			UPPER(payer_name) AS payer_name,
+			assigned_claim,
+			ROUND(past_payer_recovery::NUMERIC,2) AS initial_clp04,
+			ROUND(past_patient_recovery::NUMERIC,2) AS initial_clp05,
+			ROUND(current_payer_recovery::NUMERIC,2) AS clp04,
+			ROUND(current_patient_recovery::NUMERIC,2) AS clp05,
+			ROUND(additional_patient_recovery::NUMERIC,2) AS balance_clp05,
+			ROUND(additional_payer_recovery::NUMERIC,2) AS balance_clp04
+		FROM invoice
+		WHERE idx = 1
+		and (ROUND(additional_patient_recovery::NUMERIC,2) <> 0 or ROUND(additional_payer_recovery::NUMERIC,2)<>0)
+		)
+	-- Insere o registro na tabela invoice
+	INSERT INTO invoices (sub_provider_id, account_number, clm01, date_parser, recoverable_type_id, payer_id, 
+						 assigned_claim, past_payer_recovery, past_patient_recovery,current_payer_recovery , 
+						 current_patient_recovery, balance_patient , balance_payer)
+	select
+		sub_provider_id,
+		account_number,
+		clm01,
+		case when date_parser < date(date_trunc('month',  CONCAT(_YearMonth, '-01')::date))--@@year_month
+			 then date(date_trunc('month',  CONCAT(_YearMonth, '-01')::date)) 
+			 else date_parser
+		end as date_parser,
+		recovery_type_id,
+		payer_id,
+		assigned_claim,
+		initial_clp04,
+		initial_clp05,
+		clp04,
+		clp05,
+		balance_clp05,
+		balance_clp04
+	from final_invoice;
+ 	GET DIAGNOSTICS insert_count = ROW_COUNT;
+	end if;
+
+    RETURN insert_count;
+END;
+$function$
+;
+
+-- DROP FUNCTION invoices_insert_selected(text, text, text);
+CREATE OR REPLACE FUNCTION invoices_insert_selected(_date text, _provider text, _data text)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    insert_count INTEGER := 0;
+    _data_json JSONB;
+BEGIN
+    _data_json = _data::jsonb;
+
+    WITH convert_data AS (
+        SELECT 
+            obj->>'sub_provider_id' sub_provider_id,
+            obj->>'account_number' account_number,
+            obj->>'clm01' clm01,
+            obj->>'recovery_type_id' recovery_type_id,
+            obj->>'date_parser' date_parser,
+            obj->>'payer_id' payer_id,
+            obj->>'assigned_claim' assigned_claim,
+            obj->>'initial_clp04' initial_clp04,
+            obj->>'initial_clp05' initial_clp05,
+            obj->>'clp04' clp04,
+            obj->>'clp05' clp05,
+            obj->>'balance_clp04' balance_clp04,
+            obj->>'balance_clp05' balance_clp05
+        FROM jsonb_array_elements(_data_json) AS obj
+    ),
+	latest_invoices AS (
+	    SELECT *,
+	           ROW_NUMBER() OVER (PARTITION BY account_number, sub_provider_id ORDER BY date_parser DESC) as rn
+	    FROM invoices
+	)
+	INSERT INTO invoices (sub_provider_id, account_number, clm01, date_parser, recoverable_type_id, payer_id, 
+						 assigned_claim, past_payer_recovery, past_patient_recovery,current_payer_recovery , 
+						 current_patient_recovery, balance_patient , balance_payer)
+    SELECT 
+        c.sub_provider_id::int, 
+        c.account_number,
+        c.clm01,
+        CASE WHEN date(c.date_parser) < date(date_trunc('month',  _date::date))
+            THEN date(date_trunc('month',  _date::date)) 
+            ELSE date(c.date_parser) END AS date_parser,
+        c.recovery_type_id::int,
+        c.payer_id::int,
+        c.assigned_claim::boolean,
+        c.initial_clp04::DOUBLE PRECISION,
+        c.initial_clp05::DOUBLE PRECISION,
+        c.clp04::DOUBLE PRECISION,
+        c.clp05::DOUBLE PRECISION,
+        c.balance_clp05::DOUBLE PRECISION,            
+        c.balance_clp04::DOUBLE PRECISION
+    FROM convert_data c
+    LEFT JOIN latest_invoices i ON i.account_number = c.account_number AND i.sub_provider_id = c.sub_provider_id::int AND i.rn = 1
+    JOIN sub_providers sp ON sp.id = c.sub_provider_id::int
+    JOIN providers p ON p.id = sp.provider_id
+    WHERE p.id = _provider::int AND  -- Cast _provider here
+          (date(i.date_parser::date) < date(_date) OR i.id IS NULL);
+
+	GET DIAGNOSTICS insert_count = ROW_COUNT;
+    RETURN CONCAT (insert_count, ' registros');
+END;
+$function$
+;
+
+-- DROP FUNCTION line_items_recoverable_change_processing(int4, int4, bool, text);
+CREATE OR REPLACE FUNCTION line_items_recoverable_change_processing(_id integer, _claim_recoverable_id integer, _active boolean, _user_email text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_response_data JSONB;
+		_active_updated bool;
+		_has_permission int4;
+		_journal_data JSONB;
+	begin
+
+		SELECT 1 INTO _has_permission
+		from users u 
+		where "admin" = true
+			and upper(email ) = upper(_user_email);
+
+		IF(_has_permission IS NULL) THEN
+			SELECT upp.id INTO _has_permission
+			FROM (
+				select 
+					provider_id id
+				from claims_recoverable cr 
+				inner join sub_providers sp on sp.id = cr.sub_provider_id 
+				where cr.id = _claim_recoverable_id
+			) "provider"
+			CROSS JOIN (
+				SELECT id
+				FROM users u
+				WHERE UPPER(u."email") = UPPER(_user_email)
+			) "user"
+			JOIN user_provider_permissions upp
+				ON upp.user_id = "user".id
+					AND upp.provider_id = "provider".id;
+		END IF;
+			
+		-- Journal(debug)
+		SELECT json_build_object('action', 'line_items_recoverable_change_processing', 'id', _id, 'active', _active) INTO _journal_data;
+	
+		IF(_has_permission IS NULL) THEN
+			-- Journal(debug)
+			INSERT INTO claims_recoverable_journal("claims_recoverable_id", "user_email", "_data")
+			VALUES(_claim_recoverable_id, _user_email, _journal_data);
+
+			RETURN json_build_object('id', -401);
+		END IF;
+
+		update line_items_recoverable
+		set
+			processing = json_build_object('active', _active)
+		where
+			id = _id
+			and claim_recoverable_id in (
+				select id from claims_recoverable 
+				where 
+					id = _claim_recoverable_id 
+		    		and status_id in (select id from claims_recoverable_status where name in ('OPENED', 'TO_VALIDATE', 'READY', 'PROCESSING', 'ATTACHMENTS_WAITING_TR', 'ATTACHMENTS_WAITING_DELIVERY', 'QA', 'QA_PRE_CLIENT', 'QA_PRE_CLIENT_REJECTED', 'QA_CLIENT', 'QA_REJECTED', 'QA_CLIENT_IN_ANALYSIS', 'QA_CLIENT_REJECTED', 'QA_CLIENT_APPROVED', 'QA_CLIENT_FURTHER'))
+			)
+		returning processing->>'active' into _active_updated;
+
+		update claims_recoverable
+		set
+			total_reason_amount = (
+				select sum(cast(svc02 as numeric)) from line_items_recoverable lir where claim_recoverable_id = _claim_recoverable_id and cast(processing->>'active' as bool) is true
+				-- select sum(cast(rc->>'reason_amount' as numeric)) reason_amount 
+				-- from line_items_recoverable lir, jsonb_array_elements(reason_code) rc
+				-- where 
+				-- 	claim_recoverable_id = _claim_recoverable_id 
+				-- 	and cast(processing->>'active' as bool) is true
+			),
+			reason_code = (
+				select 
+					jsonb_agg(json_build_object('group_code', group_code, 'reason_code', reason_code, 'reason_amount', reason_amount)) reason_code
+				from (
+					--select claim_recoverable_id, rc->>'group_code' group_code, rc->>'reason_code' reason_code, sum(reason_amount) reason_amount 
+				 	select claim_recoverable_id, rc->>'group_code' group_code, rc->>'reason_code' reason_code, sum(cast(rc->>'reason_amount' as numeric)) reason_amount
+				 	from line_items_recoverable lir, jsonb_array_elements(reason_code) rc
+				 	where 
+				 		claim_recoverable_id = _claim_recoverable_id 
+				 		and cast(processing->>'active' as bool) is true
+				 	group by claim_recoverable_id, rc->>'group_code', rc->>'reason_code'
+				 ) x
+				 group by claim_recoverable_id
+			)
+		where 
+			id = _claim_recoverable_id
+			and status_id in (select id from claims_recoverable_status where name in ('OPENED', 'READY', 'PROCESSING', 'QA', 'QA_PRE_CLIENT', 'QA_PRE_CLIENT_REJECTED', 'QA_CLIENT', 'QA_REJECTED', 'QA_CLIENT_IN_ANALYSIS', 'QA_CLIENT_REJECTED', 'QA_CLIENT_APPROVED', 'QA_CLIENT_FURTHER'));
+
+		SELECT json_build_object('id', _id, 'claim_recoverable_id', _claim_recoverable_id, 'reason_code', (select reason_code from claims_recoverable cr where id = _claim_recoverable_id limit 1)) INTO _response_data;
+
+		RETURN _response_data;
+	END;
+$function$
+;
+
+-- DROP FUNCTION line_items_recoverable_insert(jsonb);
+CREATE OR REPLACE FUNCTION line_items_recoverable_insert(data jsonb)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_line_item_recoverable_id numeric;
+	begin
+				
+		INSERT INTO line_items_recoverable (
+			claim_recoverable_id,
+			"amt02_b6",
+			bpr16,
+			clp01,
+			clp02,
+			clp03,
+			clp06,
+			clp07,
+			clp08,
+			hash,
+			lq,
+			nm109_74,
+			nm109_il,
+			nm109_qc,
+			payer_n102,
+			predicted,
+			reason_amount,
+			reason_code,
+			processing,
+			ref02_6r,
+			svc01_1,
+			svc01_2,
+			svc01_3,
+			svc01_4,
+			svc01_5,
+			svc01_6,
+			svc02,
+			svc03,
+			svc04,
+			svc05,
+			svc06_1,
+			svc06_2,
+			svc06_3,
+			svc06_4,
+			svc06_5,
+			svc06_6,
+			svc06_7,
+			svc07
+		)
+		VALUES (
+			CAST(data->>'claim_recoverable_id' AS INT4),
+			data->>'amt02_b6'::text,
+			CAST(data->>'bpr16' AS date),
+			data->>'clp01',
+			data->>'clp02',
+			CAST(data->>'clp03' AS NUMERIC),
+			data->>'clp06',
+			data->>'clp07',
+			data->>'clp08',
+			data->>'hash',
+			CAST(data->>'lq' AS JSONB),
+			data->>'nm109_74',
+			data->>'nm109_il',
+			data->>'nm109_qc',
+			data->>'payer_n102',
+			CAST(data->>'predicted' AS NUMERIC),
+			CAST(data->>'reason_amount' AS NUMERIC),
+			CAST(data->>'reason_code' AS JSONB),
+			CAST(data->>'processing' AS JSONB),
+			data->>'ref02_6r',
+			data->>'svc01_1',
+			data->>'svc01_2',
+			data->>'svc01_3',
+			data->>'svc01_4',
+			data->>'svc01_5',
+			data->>'svc01_6',
+			data->>'svc02',
+			CAST(data->>'svc03' AS NUMERIC),
+			data->>'svc04',
+			data->>'svc05',
+			data->>'svc06_1',
+			data->>'svc06_2',
+			data->>'svc06_3',
+			data->>'svc06_4',
+			data->>'svc06_5',
+			data->>'svc06_6',
+			data->>'svc06_7',
+			data->>'svc07'
+		)
+		RETURNING id INTO _line_item_recoverable_id;
+		
+		
+	RETURN _line_item_recoverable_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION payers_insert(jsonb);
+CREATE OR REPLACE FUNCTION payers_insert(_data jsonb)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		inserted_id numeric;
+		_normalized_name TEXT;
+	begin
+		
+		select id INTO inserted_id
+		from payers
+		where 
+			UPPER(name) = regexp_replace(UPPER(_data->>'name'), '( ){2,}', ' ', 'g');
+
+	
+		IF inserted_id IS NULL THEN 
+			
+			IF _data->>'normalized_name' IS NULL THEN
+				SELECT _data->>'name' INTO _normalized_name;
+			ELSE
+				SELECT _data->>'normalized_name' INTO _normalized_name;
+			END IF;
+
+			INSERT INTO payers (
+				name,
+				normalized_name
+			)
+			VALUES (
+				regexp_replace(UPPER(_data->>'name'), '( ){2,}', ' ', 'g'),
+				regexp_replace(UPPER(_normalized_name), '( ){2,}', ' ', 'g')
+			)
+			RETURNING id INTO inserted_id;
+		END IF;
+		
+		
+	RETURN inserted_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION providers_insert(jsonb);
+CREATE OR REPLACE FUNCTION providers_insert(_data jsonb)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		inserted_id int4;
+	begin
+		
+		select id INTO inserted_id
+		from providers
+		where UPPER(name) = UPPER(_data->>'name');
+	
+		IF inserted_id IS NULL THEN 
+			INSERT INTO providers (
+			name
+		)
+		VALUES (
+			_data->>'name'
+		)
+		RETURNING id INTO inserted_id;
+		END IF;
+		
+		
+	RETURN inserted_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION rebills_status_update_comments_insert(jsonb, jsonb);
+CREATE OR REPLACE FUNCTION rebills_status_update_comments_insert(_data jsonb, _user_info jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		id_updated int4;
+		ret jsonb;
+	begin
+		select claims_recoverable_update_status into id_updated 
+		from claims_recoverable_update_status(cast(_data->>'claim_recoverable_id' as int4), cast(_data->>'claim_status_id' as int4));
+		if (id_updated > 0) then 
+			select claims_recoverable_comments_insert into ret 
+			from claims_recoverable_comments_insert(_data, _user_info);
+			return ret;
+		else
+			RETURN jsonb_build_object('status', 400, 'result', null);
+		end if;
+	END
+$function$
+;
+
+-- DROP FUNCTION reminder_close(jsonb);
+CREATE OR REPLACE FUNCTION reminder_close(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_claim_recoverable_id int4;
+        _reminder_user_id int4;
+		_reminder_closed boolean;
+		_user_permission text;
+		_affected_rows int4;
+		_ret jsonb;
+		reminder_closed numeric;
+	BEGIN
+		reminder_closed = -1;
+
+		SELECT
+			cr.claim_recoverable_id, cr.user_id, cr.reminder_closed INTO _claim_recoverable_id, _reminder_user_id, _reminder_closed
+		FROM claims_reminders cr
+		WHERE
+			id = CAST(_data->>'claim_reminder_id' AS int4);
+        
+		-- Verifying reminder exists 
+		IF (_claim_recoverable_id IS NOT NULL) THEN
+			-- Verifying reminder is open
+			IF (_reminder_closed = false) THEN
+				-- Verifying the reminder user
+				IF (CAST(_data->>'user_id' AS int4) = _reminder_user_id) THEN
+					_user_permission = 'close';
+				ELSE
+					-- Verifying user is in reminder
+					SELECT permission_status INTO _user_permission
+					FROM (
+						SELECT permission_status
+						FROM claims_reminders_users cru 
+						WHERE
+							cru.claim_reminder_id = CAST(_data->>'claim_reminder_id' AS int4) AND
+							cru.user_id = CAST(_data->>'user_id' AS int4)
+					) t;
+				END IF;
+
+				IF (_user_permission <> '') THEN
+					IF (_user_permission = 'close') THEN
+				  		-- Reminder closed
+				  		INSERT INTO claims_reminders_closed (
+							claim_reminder_id,
+							user_id,
+							comment
+						)
+						VALUES (
+							CAST(_data->>'claim_reminder_id' AS int4),
+							CAST(_data->>'user_id' AS int4),
+							_data->>'comment'
+						)
+						ON CONFLICT (claim_reminder_id) DO NOTHING;
+		
+						GET DIAGNOSTICS _affected_rows = ROW_COUNT;
+		
+						IF (_affected_rows = 1) THEN
+							-- close reminder
+							UPDATE claims_reminders
+							SET reminder_closed = true
+							WHERE
+								id = CAST(_data->>'claim_reminder_id' AS int4);
+			
+							GET DIAGNOSTICS _affected_rows = ROW_COUNT;
+			
+							IF (_affected_rows = 1) THEN
+								SELECT * INTO _ret 
+								FROM claims_recoverable_comments_insert(
+									jsonb_build_object(
+										'claim_recoverable_id', _claim_recoverable_id,
+										'comment', CONCAT('Reminder closed: ', _data->>'comment'),
+										'comment_type', 'MANAGEMENT',
+										'extra_params', '{}'::jsonb
+									),
+									jsonb_build_object(
+										'user_id', CAST(_data->>'user_id' AS int4),
+								        'email', _data->>'email',
+										'last_name', _data->>'last_name',
+										'first_name', _data->>'first_name'
+									)
+								);
+	
+								reminder_closed = 1;
+							END IF;
+			  			END IF;
+					ELSE
+						reminder_closed = -3;
+					END IF;
+				ELSE
+					reminder_closed = -2;
+				END IF;
+			ELSE
+				reminder_closed = -4;
+			END IF;
+		END IF;
+
+		-- RETURNS
+        --  1 -> SUCCESS
+        -- -1 -> REMINDER NOT FOUND
+        -- -2 -> USER NOT FOUND IN REMINDER
+        -- -3 -> USER DOESN'T HAVE PERMISSION TO CLOSE REMINDER
+        -- -4 -> REMINDER WAS ALREADY FINISHED
+		RETURN reminder_closed;
+	END;
+$function$
+;
+
+-- DROP FUNCTION reminder_delete(jsonb);
+CREATE OR REPLACE FUNCTION reminder_delete(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_claim_recoverable_id int4;
+		_reminder_user_id int4;
+		_reminder_closed boolean;
+		_reminder_found int4;
+		_affected_rows int4;
+		_reminder_deleted int4;
+		_ret jsonb;
+
+	BEGIN
+		_reminder_deleted = -1;
+		_affected_rows = 0;
+
+		SELECT
+			claim_recoverable_id, user_id, reminder_closed 
+			INTO _claim_recoverable_id, _reminder_user_id, _reminder_closed
+		FROM claims_reminders
+		WHERE
+			id = CAST(_data->>'claim_reminder_id' AS int4);
+		
+		-- Verifying reminder exists 
+		IF (_claim_recoverable_id IS NOT NULL) THEN
+			-- Verifying reminder is open
+			IF (_reminder_closed = false) THEN
+				-- Verifying user's reminder
+				IF (_reminder_user_id = CAST(_data->>'user_id' AS int4)) THEN
+		
+		  			-- Delete reminder's user	
+					DELETE FROM claims_reminders_users 
+					WHERE
+						claim_reminder_id = CAST(_data->>'claim_reminder_id' AS int4);
+			
+					-- Delete Reminder
+			  		DELETE FROM claims_reminders
+					WHERE 
+						id = CAST(_data->>'claim_reminder_id' AS int4);
+			
+					GET DIAGNOSTICS _affected_rows = ROW_COUNT;
+					IF (_affected_rows = 1) THEN
+						_reminder_deleted = CAST(_data->>'claim_reminder_id' AS int4);
+			
+						SELECT * INTO _ret 
+						FROM claims_recoverable_comments_insert(
+							jsonb_build_object(
+								'claim_recoverable_id', _claim_recoverable_id,
+								'comment', 'Reminder deleted',
+								'comment_type', 'MANAGEMENT',
+								'extra_params', '{}'::jsonb
+							),
+							jsonb_build_object(
+								'user_id', CAST(_data->>'user_id' AS int4),
+								'email', _data->>'email',
+								'last_name', _data->>'last_name',
+								'first_name', _data->>'first_name'
+							)
+						);
+					END IF;
+				ELSE
+					_reminder_deleted = -3;
+				END IF;
+			ELSE
+				_reminder_deleted = -2;
+			END IF;
+		END IF;
+
+		-- RETURNS
+        -- >=1 -> SUCCESS - REMINDER ID CREATED
+        --  -1 -> REMINDER NOT FOUND
+        --  -2 -> REMINDER WAS ALREADY FINISHED
+        --  -3 -> USER CAN'T DELETE REMINDER
+		RETURN _reminder_deleted;
+	END;
+$function$
+;
+
+-- DROP FUNCTION reminder_insert(jsonb);
+CREATE OR REPLACE FUNCTION reminder_insert(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		inserted_id numeric;
+        _return_inserted_users int4;
+		_ret jsonb;
+
+	BEGIN
+  		-- Reminder
+  		INSERT INTO claims_reminders (
+			claim_recoverable_id,
+			reminder_date,
+			reminder_time,
+			reminder_timezone,
+			user_id,
+			comment
+		)
+		VALUES (
+			CAST(_data->>'claim_recoverable_id' AS int4),
+			CAST(_data->>'reminder_date' AS date),
+			CAST(_data->>'reminder_time' AS time),
+			_data->>'reminder_timezone',
+			CAST(_data->>'user_id' AS int4),
+			_data->>'comment'
+		)
+		RETURNING id INTO inserted_id;
+
+		-- Users
+		IF (inserted_id IS NOT NULL) THEN
+			SELECT * INTO _return_inserted_users FROM reminder_users_insert(inserted_id, _data->>'reminder_timezone', (_data->>'users')::jsonb);
+			
+			SELECT * INTO _ret 
+			FROM claims_recoverable_comments_insert(
+				jsonb_build_object(
+					'claim_recoverable_id', CAST(_data->>'claim_recoverable_id' AS int4),
+					'comment', CONCAT('Reminder created: ', _data->>'comment'),
+					'comment_type', 'MANAGEMENT',
+					'extra_params', '{}'::jsonb
+				),
+				jsonb_build_object(
+					'user_id', CAST(_data->>'user_id' AS int4),
+					'email', _data->>'email',
+					'last_name', _data->>'last_name',
+					'first_name', _data->>'first_name'
+				)
+			);
+		ELSE
+    		inserted_id = -1;
+  		END IF;
+
+		RETURN inserted_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION reminder_update(jsonb);
+CREATE OR REPLACE FUNCTION reminder_update(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_reminder_user_id int4;
+		_reminder_closed boolean;
+        _return_inserted_users int4;
+		_ret jsonb;
+		reminder_updated int4;
+
+	BEGIN
+		-- Getting reminder info
+		SELECT user_id, reminder_closed INTO _reminder_user_id, _reminder_closed
+		FROM claims_reminders 
+		WHERE
+			id = CAST(_data->>'claim_reminder_id' AS int4);
+
+		IF (_reminder_user_id IS NOT NULL) THEN
+			-- Verifying reminder is open
+			IF (_reminder_closed = false) THEN
+				-- Verifying the reminder user
+				IF (_reminder_user_id = CAST(_data->>'user_id' AS int4)) THEN
+	
+			  		-- Reminder
+			  		UPDATE claims_reminders
+					SET
+						claim_recoverable_id = CAST(_data->>'claim_recoverable_id' AS int4),
+						reminder_date = CAST(_data->>'reminder_date' AS date),
+						reminder_time = CAST(_data->>'reminder_time' AS time),
+						reminder_timezone = _data->>'reminder_timezone',
+						comment = _data->>'comment',
+						updated_at = NOW()
+					WHERE
+						id = CAST(_data->>'claim_reminder_id' AS int4);
+		
+					-- Delete all users and insert again
+					DELETE FROM claims_reminders_users
+					WHERE claim_reminder_id = CAST(_data->>'claim_reminder_id' AS int4);
+		
+					-- Users
+					SELECT * INTO _return_inserted_users FROM reminder_users_insert(cast(_data->>'claim_reminder_id' as numeric), _data->>'reminder_timezone', (_data->>'users')::jsonb);
+					
+					reminder_updated = 1;
+
+					SELECT * INTO _ret 
+					FROM claims_recoverable_comments_insert(
+						jsonb_build_object(
+							'claim_recoverable_id', CAST(_data->>'claim_recoverable_id' AS int4),
+							'comment', CONCAT('Reminder updated: ', _data->>'comment'),
+							'comment_type', 'MANAGEMENT',
+							'extra_params', '{}'::jsonb
+						),
+						jsonb_build_object(
+							'user_id', CAST(_data->>'user_id' AS int4),
+							'email', _data->>'email',
+							'last_name', _data->>'last_name',
+							'first_name', _data->>'first_name'
+						)
+					);
+				ELSE
+					reminder_updated = -3;
+				END IF;
+			ELSE
+				reminder_updated = -2;
+			END IF;
+		ELSE
+			reminder_updated = -1;
+		END IF;
+
+		-- RETURNS
+        --  1 -> SUCCESS
+        -- -1 -> REMINDER NOT FOUND
+        -- -2 -> REMINDER WAS ALREADY FINISHED
+        -- -3 -> USER DOESN'T HAVE PERMISSION TO UPDATE REMINDER
+		RETURN reminder_updated;
+	END;
+$function$
+;
+
+-- DROP FUNCTION reminder_users_delete(jsonb);
+CREATE OR REPLACE FUNCTION reminder_users_delete(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_claim_recoverable_id int4;
+		_reminder_user_id int4;
+		_reminder_closed boolean;
+		_affected_rows int4;
+		_reminder_user_name_deleted text;
+		_ret jsonb;
+		reminder_user_deleted int4;
+
+	BEGIN
+		reminder_user_deleted = -1;
+
+		SELECT claim_recoverable_id, user_id, reminder_closed INTO _claim_recoverable_id, _reminder_user_id, _reminder_closed
+		FROM claims_reminders
+		WHERE
+			id = CAST(_data->>'claim_reminder_id' AS int4);
+
+		-- Verifying reminder exists
+		IF (_claim_recoverable_id IS NOT NULL) THEN
+			-- Verifying reminder is open
+			IF (_reminder_closed = false) THEN
+				-- Verifying delete user permission
+				IF (CAST(_data->>'delete_user_id' AS int4) = CAST(_data->>'user_id' AS int4) OR _reminder_user_id = CAST(_data->>'user_id' AS int4)) THEN
+	
+					DELETE FROM claims_reminders_users
+					WHERE
+						claim_reminder_id = CAST(_data->>'claim_reminder_id' AS int4) AND 
+						user_id = CAST(_data->>'delete_user_id' AS int4);
+
+					GET DIAGNOSTICS _affected_rows = ROW_COUNT;
+			
+					IF (_affected_rows = 1) THEN
+						reminder_user_deleted = 1;
+
+						SELECT name INTO _reminder_user_name_deleted FROM users WHERE id = CAST(_data->>'delete_user_id' AS int4);
+
+						SELECT * INTO _ret
+						FROM claims_recoverable_comments_insert(
+							jsonb_build_object(
+								'claim_recoverable_id', _claim_recoverable_id,
+								'comment', CONCAT('User ', _reminder_user_name_deleted, ' removed from reminder'),
+								'comment_type', 'MANAGEMENT',
+								'extra_params', '{}'::jsonb
+							),
+							jsonb_build_object(
+								'user_id', CAST(_data->>'user_id' AS int4),
+								'email', _data->>'email',
+								'last_name', _data->>'last_name',
+								'first_name', _data->>'first_name'
+							)
+						);
+					ELSE
+						reminder_user_deleted = -4;
+					END IF;
+				ELSE
+					reminder_user_deleted = -3;
+				END IF;
+			ELSE
+				reminder_user_deleted = -2;
+			END IF;
+		END IF;
+
+		-- RETURNS
+        --  1 -> SUCCESS
+        -- -1 -> REMINDER NOT FOUND
+        -- -2 -> REMINDER WAS ALREADY FINISHED
+        -- -3 -> USER CAN'T DELETE USER
+        -- -4 -> USER NOT FOUND IN REMINDER
+		RETURN reminder_user_deleted;
+	END;
+$function$
+;
+
+
+
+-- DROP FUNCTION reminder_users_insert(uuid, text, jsonb);
+CREATE OR REPLACE FUNCTION reminder_users_insert(_reminder_id uuid, _reminder_timezone text, _users jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_affected_rows int4;
+		_curr_affected_rows int4;
+        _user int4;
+	BEGIN
+		_affected_rows = 0;
+
+		-- Users
+		FOR _user IN SELECT (jsonb_array_elements_text((_users)::jsonb))::int
+			LOOP
+				INSERT INTO claims_reminders_users (
+					claim_reminder_id,
+	                user_id,
+                    reminder_timezone,
+                    permission_status
+				) VALUES (
+					_reminder_id,
+					_user,
+					_reminder_timezone,
+                    'close'
+				);
+
+				GET DIAGNOSTICS _curr_affected_rows = ROW_COUNT;
+
+				IF (_curr_affected_rows = 1) THEN
+					_affected_rows = _affected_rows + _curr_affected_rows;
+				END IF;
+			END LOOP;
+		RETURN _affected_rows;
+	END;
+$function$
+;
+
+-- DROP FUNCTION reminder_users_insert(numeric, text, jsonb);
+CREATE OR REPLACE FUNCTION reminder_users_insert(_reminder_id numeric, _reminder_timezone text, _users jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_affected_rows int4;
+		_curr_affected_rows int4;
+        _user int4;
+	BEGIN
+		_affected_rows = 0;
+
+		-- Users
+		FOR _user IN SELECT (jsonb_array_elements_text((_users)::jsonb))::int
+			LOOP
+				INSERT INTO claims_reminders_users (
+					claim_reminder_id,
+	                user_id,
+                    reminder_timezone,
+                    permission_status
+				) VALUES (
+					_reminder_id,
+					_user,
+					_reminder_timezone,
+                    'close'
+				);
+
+				GET DIAGNOSTICS _curr_affected_rows = ROW_COUNT;
+
+				IF (_curr_affected_rows = 1) THEN
+					_affected_rows = _affected_rows + _curr_affected_rows;
+				END IF;
+			END LOOP;
+		RETURN _affected_rows;
+	END;
+$function$
+;
+
+-- DROP FUNCTION report_batch_generation_s3(date, text, text, text, text);
+CREATE OR REPLACE FUNCTION report_batch_generation_s3(dt date, provider text, bucket text, dir_path text, region text DEFAULT 'us-east-1'::text)
+ RETURNS boolean
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_retval_files_uploaded integer;
+		_files_uploaded integer;
+		_query text;
+		_file_name text;
+		_file_path text;
+		_num_rows integer;
+	begin
+		-- Initialize files uploaded counter
+		_retval_files_uploaded = 0;
+
+        -- Creating file_name
+        select concat('Report_', to_char(dt, 'YYYYMMDD'), '.csv') into _file_name;
+
+        -- Preparing file_path
+        select concat(trim(dir_path, '/'), '/', _file_name) into _file_path;
+
+		select count(1) into _num_rows
+		from batch_resubmissions br
+		join providers p on br.provider_id = p.id
+		where
+			br.resubmission_date = dt and 
+			p."name" = provider;
+		
+		if (_num_rows > 0) then
+	        -- Prepare query using each business unit
+	        select concat('
+	            WITH data AS (
+	                SELECT
+	                    cr.id as id,
+	                    cr.batch_resubmissions_id,
+	                    cr.account_number as account_number,
+	                    sp.acronym as sub_provider,
+	                    pr.name as provider,
+	                    pa.name as payer_name,
+	                    cr835.bpr16 as denial_date,
+	                    br.resubmission_date as resubmission_date,
+	                    cr.reason_code as reason_code,
+	                    cr.description as description,
+	                    cr.total_reason_amount as total_reason_amount,
+	                    crt.name as claim_type
+	                FROM claims_recoverable cr
+	                LEFT JOIN payers pa on cr.payer_id = pa.id
+	                LEFT JOIN sub_providers sp on cr.sub_provider_id = sp.id
+	                LEFT JOIN providers pr on sp.provider_id = pr.id
+	                LEFT JOIN claims_recoverable_status crs on cr.status_id = crs.id
+	                LEFT JOIN claims_recoverable_type crt on crt.id = cr.recoverable_type_id
+	                LEFT JOIN batch_resubmissions br on br.id = cr.batch_resubmissions_id
+	                LEFT JOIN claims_recoverable_835 cr835 on cr.id = cr835.claim_recoverable_id
+	                WHERE
+	                    pr.name = ''', provider, '''
+	                    AND crs.id = 3
+	                    AND br.resubmission_date = ''', dt, '''
+	            ),
+	            times as (
+	                SELECT account_number, count(1)+1 billing_sequence
+	                FROM claims_recoverable cr
+	                JOIN sub_providers sp on cr.sub_provider_id = sp.id
+					JOIN providers p on sp.provider_id = p.id 
+	                WHERE p.name = ''', provider, '''
+	                GROUP BY account_number
+	            )
+	            SELECT a.id
+	                 , a.account_number
+	                 , sub_provider
+	                 , provider, payer_name
+	                 , denial_date
+	                 , resubmission_date
+	                 , total_reason_amount
+	                 , t.billing_sequence
+	                 , REGEXP_REPLACE(cast(b.reasons_code as text), ''[{}]'', '''', ''g'') as reasons_code
+	                 , description
+	                 , claim_type
+	                 , batch_resubmissions_id
+	            FROM data AS a
+	            JOIN times t ON a.account_number = t.account_number
+	            LEFT JOIN (
+	               SELECT id, array_agg(reason->>''reason_code'') as reasons_code
+	               FROM (
+	                  SELECT id, jsonb_array_elements(reason_code::jsonb) as reason FROM data
+	               ) t
+	               GROUP BY id
+	            ) b on a.id = b.id;') into _query;
+	
+	        -- Start test airflow steward reports
+			SELECT files_uploaded into _files_uploaded
+			from aws_s3.query_export_to_s3(_query, aws_commons.create_s3_uri('claims-management-data-lake', concat('tmp/export/report/backup_airflow_outbound_steward/', _file_name), region));
+			-- End test airflow steward reports	
+		
+	        -- Create file in aws s3 provider directory
+	        SELECT files_uploaded into _files_uploaded
+	        FROM aws_s3.query_export_to_s3(_query, aws_commons.create_s3_uri(bucket, _file_path, region));
+
+	        -- Increments uploaded files into aws s3
+	        _retval_files_uploaded = _retval_files_uploaded + _files_uploaded;
+	    end if;
+
+		return _retval_files_uploaded > 0;
+	end;
+$function$
+;
+
+-- DROP FUNCTION responses_835_insert(jsonb);
+CREATE OR REPLACE FUNCTION responses_835_insert(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		responses_835_inserted_id TEXT;
+		_last_claims_recoverable_clm01_id INT4;
+		_sub_provider_id INT4;
+		_provider_id INT4;
+		_payer_id INT4;
+		_claims_recoverable_status_id INT4;
+
+		_sub_providers_data JSONB;
+		_claims_recoverable_status_data JSONB;
+		_providers_data JSONB;
+	begin
+
+		
+		SELECT CAST(_data->>'sub_providers' AS JSONB) INTO _sub_providers_data;
+		
+		-- provider
+		SELECT CAST(_sub_providers_data->>'providers' AS JSONB) INTO _providers_data;
+		select id INTO _provider_id
+		from providers
+		where UPPER(name) = UPPER(_providers_data->>'name');
+		
+		select cr.id into _last_claims_recoverable_clm01_id
+		from claims_recoverable cr
+		left join sub_providers sp
+			on cr.sub_provider_id = sp.id
+		join providers p
+			on sp.provider_id = p.id
+		where 
+			p.id = _provider_id
+			and cr.clm01 = _data->>'clm01'
+			and cr.batch_resubmissions_id is not null
+		order by cr.created_at desc
+		limit 1;
+
+		IF _last_claims_recoverable_clm01_id IS NULL THEN
+			RETURN -1;
+		END IF;
+
+		-- claims_recoverable_status
+		SELECT jsonb_build_object('name', _data->>'status') INTO _claims_recoverable_status_data;
+		SELECT claims_recoverable_status_insert(_claims_recoverable_status_data) INTO _claims_recoverable_status_id;
+
+		-- sub_providers
+		SELECT sub_providers_insert(_sub_providers_data) INTO _sub_provider_id;
+		
+		-- payers
+		SELECT payers_insert(CAST(_data->>'payers' AS JSONB)) INTO _payer_id;
+
+		INSERT INTO responses_835 (
+			clm01,
+			file_name,
+			file_hash,
+			claim_hash,
+			clp04,
+			clp07,
+			balance,
+			date_parser,
+			bpr16,
+			reason_code,
+			sub_provider_id,
+			payer_id,
+			claim_recoverable_id,
+			status_id,
+			clp02,
+			clp05,
+			balance_clp04,
+			balance_clp05,
+			adjustment_clp05
+		)
+		VALUES (
+			_data->>'clm01',
+			_data->>'file_name',
+			_data->>'file_hash',
+			_data->>'claim_hash',
+			CAST(_data->>'clp04' AS DOUBLE PRECISION),
+			_data->>'clp07',
+			CAST(_data->>'balance' AS NUMERIC),
+			CAST(_data->>'date_parser' AS DATE),
+			CAST(_data->>'bpr16' AS DATE),
+			CAST(_data->>'reason_code' AS JSONB),
+			_sub_provider_id,
+			_payer_id,
+			_last_claims_recoverable_clm01_id,
+			_claims_recoverable_status_id,
+			CAST(_data->>'clp02' AS INT4),
+			CAST(_data->>'clp05' AS DOUBLE PRECISION),
+			CAST(_data->>'balance_clp04' AS NUMERIC),
+			CAST(_data->>'balance_clp05' AS NUMERIC),
+			CAST(_data->>'adjustment_clp05' AS NUMERIC)
+		)
+		RETURNING id INTO responses_835_inserted_id;	
+		
+	RETURN responses_835_inserted_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION try_cast(in text, inout anyelement);
+CREATE OR REPLACE FUNCTION try_cast(_in text, INOUT _out anyelement)
+ RETURNS anyelement
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+   EXECUTE format('SELECT %L::%s', $1, pg_typeof(_out))
+   INTO  _out;
+EXCEPTION WHEN others THEN
+   -- do nothing: _out already carries default
+END
+$function$
+;
+
+-- DROP FUNCTION user_provider_permissions_insert(jsonb);
+CREATE OR REPLACE FUNCTION user_provider_permissions_insert(_data jsonb)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_inserted_rows int4;
+	begin
+
+    -- permissions
+    INSERT INTO user_provider_permissions("user_id", "provider_id")
+    SELECT a.user_id, cast(b.provider_id AS int4)
+      FROM (
+        SELECT cast( _data->>'user_id' AS INT4) AS user_id
+      ) a
+      CROSS JOIN (
+        SELECT JSONB_ARRAY_ELEMENTS(CAST(_data->>'provider_ids' AS JSONB)) AS provider_id
+      ) b
+    ON CONFLICT ("user_id", "provider_id") DO nothing;
+    
+   	GET DIAGNOSTICS _inserted_rows = ROW_COUNT;
+   
+	RETURN _inserted_rows;
+
+	END;
+$function$
+;
+
+
+
+-- DROP FUNCTION user_provider_permissions_remove(jsonb);
+CREATE OR REPLACE FUNCTION user_provider_permissions_remove(_data jsonb)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_removed_rows int4;
+	begin
+
+    -- permissions
+    DELETE from user_provider_permissions
+	WHERE id IN (
+		SELECT id
+		FROM (
+			SELECT a.user_id, cast(b.provider_id AS int4) provider_id
+			FROM (
+			  SELECT cast( _data->>'user_id' AS int4) AS user_id
+			) a
+			CROSS JOIN (
+			  SELECT JSONB_ARRAY_ELEMENTS(CAST(_data->>'provider_ids' AS JSONB)) AS provider_id
+			) b
+		) src
+		JOIN user_provider_permissions permissions
+			ON src.user_id = permissions.user_id
+				AND src.provider_id = permissions.provider_id
+    );
+	
+    GET DIAGNOSTICS _removed_rows = ROW_COUNT;
+	
+   	RETURN _removed_rows;
+	END;
+$function$
+;
+
+-- DROP FUNCTION users_delete(int4);
+CREATE OR REPLACE FUNCTION users_delete(_user_id integer)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		_row numeric;
+	begin
+		update users 
+		set deleted_at = now()
+		where id = _user_id;
+	
+		GET DIAGNOSTICS _row = ROW_COUNT;
+		IF _row = 1 then
+			RETURN _user_id;
+		else
+			RETURN -1;
+		END IF;
+	END;
+$function$
+;
+
+-- DROP FUNCTION users_insert(jsonb);
+CREATE OR REPLACE FUNCTION users_insert(_data jsonb)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	declare
+		inserted_id numeric;
+	begin
+
+		SELECT id INTO inserted_id
+		FROM users
+		WHERE UPPER(email) = UPPER(_data->>'email');
+		
+        IF inserted_id IS NULL THEN
+            INSERT INTO users ("email", "admin", "fixer", "name", "user_group", "timezone")
+            VALUES (
+                LOWER(_data->>'email'),
+                CHARACTER_LENGTH(COALESCE(_data->>'admin', null)) > 0,
+                CHARACTER_LENGTH(COALESCE(_data->>'fixer', null)) > 0,
+                COALESCE(_data->>'name', LOWER(_data->>'email')),
+                CAST(_data->>'user_group' AS jsonb),
+                CAST(_data->>'timezone' AS text)
+            )
+            RETURNING id INTO inserted_id;
+        ELSE
+            RETURN -1;
+        END IF;
+		
+	RETURN inserted_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION users_update(jsonb);
+CREATE OR REPLACE FUNCTION users_update(_data jsonb)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		updated_id numeric;
+	BEGIN
+
+        UPDATE users
+		SET
+            admin = cast(CHARACTER_LENGTH(COALESCE(_data->>'admin', null)) > 0 AS bool),
+            fixer = cast(CHARACTER_LENGTH(COALESCE(_data->>'fixer', null)) > 0 AS bool),
+            name = COALESCE(_data->>'name', LOWER(_data->>'email')),
+            user_group = CAST(_data->>'user_group' AS jsonb),
+            timezone = CAST(_data->>'timezone' AS text),
+            updated_at = now()
+		WHERE
+			id = cast(_data->>'id' as int8)
+		RETURNING id INTO updated_id;
+
+	RETURN updated_id;
+	END;
+$function$
+;
+
+-- DROP FUNCTION uuid_generate_v1();
+CREATE OR REPLACE FUNCTION uuid_generate_v1()
+ RETURNS uuid
+ LANGUAGE c
+ PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_generate_v1$function$
+;
+
+-- DROP FUNCTION uuid_generate_v1mc();
+CREATE OR REPLACE FUNCTION uuid_generate_v1mc()
+ RETURNS uuid
+ LANGUAGE c
+ PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_generate_v1mc$function$
+;
+
+-- DROP FUNCTION uuid_generate_v3(uuid, text);
+CREATE OR REPLACE FUNCTION uuid_generate_v3(namespace uuid, name text)
+ RETURNS uuid
+ LANGUAGE c
+ IMMUTABLE PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_generate_v3$function$
+;
+
+-- DROP FUNCTION uuid_generate_v4();
+CREATE OR REPLACE FUNCTION uuid_generate_v4()
+ RETURNS uuid
+ LANGUAGE c
+ PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_generate_v4$function$
+;
+
+-- DROP FUNCTION uuid_generate_v5(uuid, text);
+CREATE OR REPLACE FUNCTION uuid_generate_v5(namespace uuid, name text)
+ RETURNS uuid
+ LANGUAGE c
+ IMMUTABLE PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_generate_v5$function$
+;
+
+-- DROP FUNCTION uuid_nil();
+CREATE OR REPLACE FUNCTION uuid_nil()
+ RETURNS uuid
+ LANGUAGE c
+ IMMUTABLE PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_nil$function$
+;
+
+-- DROP FUNCTION uuid_ns_dns();
+CREATE OR REPLACE FUNCTION uuid_ns_dns()
+ RETURNS uuid
+ LANGUAGE c
+ IMMUTABLE PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_ns_dns$function$
+;
+
+-- DROP FUNCTION uuid_ns_oid();
+CREATE OR REPLACE FUNCTION uuid_ns_oid()
+ RETURNS uuid
+ LANGUAGE c
+ IMMUTABLE PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_ns_oid$function$
+;
+
+-- DROP FUNCTION uuid_ns_url();
+CREATE OR REPLACE FUNCTION uuid_ns_url()
+ RETURNS uuid
+ LANGUAGE c
+ IMMUTABLE PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_ns_url$function$
+;
+
+-- DROP FUNCTION uuid_ns_x500();
+CREATE OR REPLACE FUNCTION uuid_ns_x500()
+ RETURNS uuid
+ LANGUAGE c
+ IMMUTABLE PARALLEL SAFE STRICT
+AS '$libdir/uuid-ossp', $function$uuid_ns_x500$function$
+;
+
+-- DROP FUNCTION verifypaymentsediandmeditech(date);
+CREATE OR REPLACE FUNCTION verifypaymentsediandmeditech(_dt date)
+ RETURNS TABLE(r_clm01 text, r_account_number text, r_file_name text, r_file_hash text, r_claim_hash text, r_clp02 text, r_clp04 double precision, r_clp05 double precision, r_clp07 text, r_bpr16 date, r_date_parser date, r_payer text, r_provider text, r_sub_provider text, r_balance double precision, r_status text, r_balance_clp04 double precision, r_balance_clp05 double precision, r_reason_codes jsonb)
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+	RETURN QUERY
+	with
+		day_select as (
+			select
+				id,
+				clm01,
+				account_number,
+				provider,
+				sub_provider,
+				batch_resubmissions_id,
+				resubmission_date
+			from (
+				select
+					cr.id,
+					cr.clm01,
+					cr.account_number,
+					p.name as provider,
+					sp.acronym as sub_provider,
+					cr.batch_resubmissions_id,
+					br.resubmission_date,
+					row_number() over (partition by cr.account_number order by cr.id desc) idx
+				from claims_recoverable cr
+				join sub_providers sp on cr.sub_provider_id = sp.id
+				join providers p on sp.provider_id = p.id
+				join edi835 e on 
+					cr.account_number = e.account_number and 
+					e.provider = UPPER('STEWARD')
+				left join batch_resubmissions br on cr.batch_resubmissions_id = br.id
+				where
+					date(e.date_parser) = _dt and
+					e.provider = UPPER('STEWARD')
+				and
+					-- cr.batch_resubmissions_id is not null
+					cast(e.bpr16 as date) >= br.resubmission_date
+			) t
+			where idx = 1 
+		),
+		dataset as (
+			select
+				ds.id,
+				ds.clm01,
+				ds.account_number,
+				ds.provider,
+				ds.sub_provider,
+				e.file_name,
+				e.file_hash,
+				cast(e.date_parser as date) as date_parser,
+				cast(e.bpr16 as date) as bpr16,
+				convert_from(decode(loop2000, 'base64'), 'UTF8')::JSONB->>'loop2100' loop2100,
+				convert_from(decode(loop1000a, 'base64'), 'UTF8')::JSONB->>'n102' as payer,
+				row_number() over (partition by e.account_number, e.file_hash order by e.date_parser desc) as idx_responses,
+				ds.resubmission_date
+			from day_select ds
+			join edi835 e on 
+				ds.account_number = e.account_number and 
+				e.provider = UPPER('STEWARD')
+			where
+				date(e.date_parser) = _dt
+		),
+		t as (
+			select
+				idx_responses,
+				account_number,
+				loop2100::JSONB->>'claimhash' claim_hash,
+				jsonb_array_elements((jsonb_array_elements(((loop2100::JSONB->>'loop2110')::JSONB)::jsonb)->>'cas')::jsonb) as reasons
+			from dataset
+		),
+		reasons as (
+			select
+				idx_responses,
+				account_number,
+				claim_hash,
+				group_code,
+				(array_agg(elem_value ORDER BY inside_array_order))[1] as reason_code,
+				(array_agg(elem_value ORDER BY inside_array_order))[2] as reason_amount
+			FROM (
+				select
+					idx_responses,
+					idx,
+					account_number,
+					claim_hash,
+					elem_value,
+					group_code,
+					floor((elem_order - 2)/3) inside_array_index,
+					floor((elem_order - 2)%3) inside_array_order
+				FROM (
+					select
+						idx_responses,
+						idx,
+						account_number,
+						claim_hash,
+						reasons,
+						trim(reasons[0]::TEXT, '"') group_code,
+						(array_agg(reasons))[1] reason_arr
+					FROM (
+						select
+							idx_responses,
+							ROW_NUMBER() OVER() idx,
+							account_number,
+							claim_hash,
+							reasons
+						from t
+					) t
+					GROUP by
+						idx_responses,
+						idx,
+						account_number,
+						claim_hash,
+						reasons
+				) t1,
+				jsonb_array_elements_text(t1.reason_arr) WITH ORDINALITY AS json_elements(elem_value, elem_order)
+			) t2
+			WHERE inside_array_order >= 0
+			GROUP by
+				idx_responses,
+				idx,
+				account_number,
+				claim_hash,
+				group_code,
+				inside_array_index
+		),
+		reasons_denied as (
+			select
+				idx_responses,
+				account_number,
+				claim_hash,
+				jsonb_agg(reasons) as reason_codes
+			from (
+				select
+					idx_responses,
+					account_number,
+					claim_hash,
+					jsonb_build_object(
+						'group_code', group_code,
+						'reason_code', reason_code,
+						'reason_amount', sum(reason_amount::numeric)
+					) as reasons
+				from reasons
+				where
+					group_code <> 'PR'
+				group by
+					idx_responses,
+					account_number,
+					claim_hash,
+					group_code,
+					reason_code
+			) t
+			group by
+				idx_responses,
+				account_number,
+				claim_hash
+		),
+		balance_clp05 as (
+			select
+				idx_responses,
+				account_number,
+				group_code,
+				sum(reason_amount::numeric) as patient_amount
+			from reasons
+			where
+				group_code = 'PR' and reason_code in ('3')
+			group by
+				idx_responses,
+				account_number,
+				group_code
+		),
+		final_responses as (
+			select
+				id,
+				clm01,
+				account_number,
+				file_name,
+				file_hash,
+				date_parser,
+				resubmission_date,
+				bpr16,
+				loop2100::JSONB->>'claimhash' claim_hash,
+				cast(loop2100::JSONB->>'clp04' as numeric) clp04,
+				case when loop2100::JSONB->>'clp05' = '' then 0 else cast(loop2100::JSONB->>'clp05' as numeric) end as clp05,
+				loop2100::JSONB->>'clp07' clp07,
+				provider,
+				sub_provider,
+				payer,
+				loop2100::JSONB->>'clp02' clp02,
+				idx_responses
+			from dataset
+		),
+		result_by_edis as (
+			select
+				clm01,
+				account_number,
+				file_name,
+				file_hash,
+				claim_hash,
+				clp02,
+				clp04,
+				clp05,
+				clp07,
+				bpr16,
+				date_parser,
+				payer,
+				provider,
+				sub_provider,
+				balance,
+				status,
+				balance_clp04,
+				balance_clp05,
+				reason_codes
+			from (
+				select
+					f.clm01,
+					f.account_number,
+					file_name,
+					file_hash,
+					f.claim_hash,
+					clp02,
+					clp04,
+					clp05,
+					clp07,
+					bpr16,
+					date_parser,
+					payer,
+					provider,
+					sub_provider,
+					(clp04 + coalesce(b05.patient_amount, 0)) as balance,
+					CASE
+						WHEN clp02 = '4' THEN 'DENIED'
+						WHEN clp02 = '22' THEN 'PENDING_CLAWBACK'
+						WHEN EXISTS (
+							SELECT 1
+							FROM reasons r
+							WHERE r.account_number = f.account_number and r.claim_hash = f.claim_hash
+							AND (group_code = 'CO' and reason_code = '29')
+						) THEN 'EXPIRED'
+						WHEN clp04 > 0 THEN 'ACCEPTED_AND_PAID'
+						WHEN coalesce(b05.patient_amount, 0) > 0 THEN 'ACCEPTED_AND_ADJUSTED_PR'
+						ELSE 'DENIED'
+					END AS status,
+					clp04 as balance_clp04,
+					coalesce(b05.patient_amount, 0) as balance_clp05,
+					rd.reason_codes,
+					row_number() over(partition by f.claim_hash) idx
+				from final_responses f
+				left join balance_clp05 b05 on f.account_number = b05.account_number and f.idx_responses = b05.idx_responses
+				left join reasons_denied rd on f.account_number = rd.account_number and f.claim_hash = rd.claim_hash and f.idx_responses = rd.idx_responses
+				where
+					not (clp02 ='22' and clp04 = '0' and coalesce(b05.patient_amount, 0) = 0) and
+					not (clp02 in ('23', '25')) -- Not Our Claim and No Payment
+			) t
+			where
+				idx = 1
+			order by
+				clm01,
+				date_parser,
+				clp02 desc,
+				clp04
+		),
+		dataset_meditech AS (
+			SELECT
+				DISTINCT
+					first_value(cr.clm01) over (partition BY cr.account_number ORDER BY cr.id DESC) clm01,
+					cr.account_number,
+					'' AS file_name,
+					'' AS file_hash,
+					md5(concat(
+						ct.account_number,
+						ct.transaction_number_id, 
+						ct.transaction_service_date, 
+						transaction_batch_date,
+						charge_proc_id,
+						amount,
+						insurance_id)
+					) AS claim_hash,
+					CASE WHEN cast(ct.amount as numeric) < 0 THEN '22' ELSE '1' END AS clp02,
+					cast(ct.amount as numeric) AS clp04,
+					0 AS clp05,
+					NULL AS clp07,
+					date(ct.transaction_service_date) AS bpr16,
+					date(ct.transaction_batch_date) AS date_parser,
+					CASE WHEN ct.insurance_id = 'SP' THEN 'SP' ELSE p2."name" END AS payer,
+					P."name" AS provider,
+					sp.acronym AS sub_provider,
+					cast(ct.amount as numeric) AS balance,
+					CASE
+						WHEN cast(ct.amount as numeric) < 0 THEN 'PENDING_CLAWBACK'
+						WHEN cast(ct.amount as numeric) > 0 THEN 'ACCEPTED_AND_PAID' 
+						ELSE 'DENIED' 
+					END AS status,
+					cast(ct.amount as numeric) AS balance_clp04,
+					0 AS balance_clp05,
+					'{}'::jsonb AS reason_codes
+			FROM raw.claims_transactions ct 
+			JOIN claims_recoverable cr ON ct.account_number = cr.account_number
+			JOIN batch_resubmissions br ON cr.batch_resubmissions_id = br.id 
+			JOIN sub_providers sp ON cr.sub_provider_id = sp.id
+			JOIN providers p ON sp.provider_id = p.id
+			JOIN payers p2 ON cr.payer_id = p2.id 
+			WHERE
+				UPPER(ct.provider) = UPPER('STEWARD') AND
+				date(ct.transaction_service_date) > br.resubmission_date AND
+				date(ct.transaction_batch_date) > br.resubmission_date AND
+				date(ct.transaction_batch_date) = _dt
+		),
+		accounts AS (
+			SELECT DISTINCT account_number 
+			FROM dataset_meditech 
+		),
+		postgres_balance AS (
+			SELECT
+				account_number,
+				sum(amount) AS amount
+			FROM (
+				-- Valores iniciais de cada account_number 
+				SELECT
+					civ.account_number,
+					initial_clp04 + initial_clp05 AS amount
+				FROM claims_initial_values civ 
+				JOIN accounts a ON civ.account_number = a.account_number
+				
+				UNION ALL
+				
+				-- O que já tem no postgres
+				SELECT 
+					cr.account_number,
+					round(coalesce(sum(r.balance_clp04), 0), 2) amount
+				FROM claims_recoverable cr 
+				JOIN sub_providers sp ON cr.sub_provider_id = sp.id 
+				JOIN providers p ON sp.provider_id = p.id
+				JOIN accounts a ON cr.account_number = a.account_number
+				left JOIN responses_835 r ON cr.id = r.claim_recoverable_id 
+				where
+					r.date_parser < _dt
+				GROUP BY
+					cr.account_number
+			
+				UNION ALL
+				
+				-- o que vai ser adicionado
+				SELECT
+					tr.account_number,
+					round(coalesce(sum(tr.balance_clp04), 0)::numeric, 2) amount
+				FROM result_by_edis tr
+				JOIN accounts a ON tr.account_number = a.account_number
+				--where
+				--	claim_hash NOT IN (SELECT claim_hash FROM responses_835 r)
+				GROUP BY
+					tr.account_number
+			) t 
+			GROUP BY account_number
+		),
+		meditech_balance AS (
+			SELECT
+				ct.account_number,
+				sum(cast(ct.amount AS numeric)) AS amount
+			FROM raw.claims_transactions ct 
+			JOIN accounts a ON ct.account_number = a.account_number
+			where
+				UPPER(ct.provider) = UPPER('STEWARD') AND 
+				date(ct.transaction_batch_date) <= _dt
+			GROUP BY
+				ct.account_number
+		),
+		meditech_balance_zero_current_day AS (
+			SELECT
+				account_number
+			FROM (
+				SELECT
+					account_number,
+					sum(balance_clp04) AS amount
+				FROM dataset_meditech 
+				GROUP BY
+					account_number
+			) t 
+			WHERE amount = 0
+		),
+		account_numbers_selected AS (
+			SELECT
+				mb.account_number
+			FROM meditech_balance mb
+			left JOIN postgres_balance pb ON mb.account_number = pb.account_number
+			left JOIN meditech_balance_zero_current_day z ON mb.account_number = z.account_number
+			where
+				round(mb.amount::numeric, 2) <> round(pb.amount::numeric, 2) OR z.account_number IS NOT NULL
+		),
+		result_by_meditech as (
+			SELECT
+				ds.clm01,
+				ds.account_number,
+				ds.file_name,
+				ds.file_hash,
+				ds.claim_hash,
+				ds.clp02,
+				ds.clp04,
+				ds.clp05,
+				ds.clp07,
+				ds.bpr16,
+				ds.date_parser,
+				ds.payer,
+				ds.provider,
+				ds.sub_provider,
+				ds.balance,
+				ds.status,
+				ds.balance_clp04,
+				ds.balance_clp05,
+				ds.reason_codes
+			FROM dataset_meditech ds
+			JOIN account_numbers_selected ans ON ds.account_number = ans.account_number
+			LEFT JOIN result_by_edis tr ON ds.account_number = tr.account_number AND ds.bpr16 = tr.bpr16 AND ds.balance_clp04 = tr.balance_clp04
+			WHERE tr.account_number IS null
+		)
+	select
+		clm01,
+		account_number,
+		file_name,
+		file_hash,
+		claim_hash,
+		clp02,
+		cast(clp04 as float8) as clp04,
+		cast(clp05 as float8) as clp05,
+		clp07,
+		bpr16,
+		date_parser,
+		payer,
+		provider,
+		sub_provider,
+		cast(balance as float8) as balance,
+		status,
+		cast(balance_clp04 as float8) as balance_clp04,
+		cast(balance_clp05 as float8) as balance_clp05,
+		reason_codes
+	from result_by_edis
+	union all 
+	select
+		clm01,
+		account_number,
+		file_name,
+		file_hash,
+		claim_hash,
+		clp02,
+		cast(clp04 as float8) as clp04,
+		cast(clp05 as float8) as clp05,
+		clp07,
+		bpr16,
+		date_parser,
+		payer,
+		provider,
+		sub_provider,
+		cast(balance as float8) as balance,
+		status,
+		cast(balance_clp04 as float8) as balance_clp04,
+		cast(balance_clp05 as float8) as balance_clp05,
+		reason_codes
+	from result_by_meditech;
+END 
+$function$
+;
+
+-- DROP FUNCTION sub_providers_insert(jsonb);
+CREATE OR REPLACE FUNCTION sub_providers_insert(_data jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		sub_provider_inserted_id int4;
+		provider_inserted_id int4;
+
+	BEGIN
+		-- providers
+	    SELECT providers_insert(CAST(_data->>'providers' AS jsonb)) INTO provider_inserted_id;
+
+		SELECT id INTO sub_provider_inserted_id
+		FROM sub_providers
+		WHERE 
+			upper(acronym) = _data->>'acronym' AND 
+			provider_id = provider_inserted_id
+		LIMIT 1;
+
+		IF (sub_provider_inserted_id IS NULL) THEN
+			INSERT INTO sub_providers (
+	          acronym,
+	          name,
+	          tax_id,
+	          provider_id,
+			  data_lake_sub_provider
+	        )
+	        VALUES (
+	          _data->>'acronym',
+	          _data->'providers'->>'name',
+	          _data->>'sub_provider_tax_id',
+	          provider_inserted_id,
+              _data->>'acronym'
+	        )	        
+	        RETURNING id INTO sub_provider_inserted_id;
+		END IF;
+
+		-- sub_providers_taxid
+		INSERT INTO sub_providers_taxid (tax_id, sub_provider_id, sub_provider_dashboard_id)
+		SELECT COALESCE(_data->>'sub_provider_tax_id', ''), sub_provider_inserted_id, default_dashboard_sub_provider_id
+		FROM sub_providers_default spd 
+		WHERE sub_provider_id = sub_provider_inserted_id
+		ON CONFLICT(tax_id, sub_provider_id)
+		DO NOTHING;
+	
+		RETURN sub_provider_inserted_id;
+	END;
+$function$
+;
+
+--DROP FUNCTION payers_nm109_insert(_data jsonb);
+CREATE OR REPLACE FUNCTION payers_nm109_insert(_data jsonb)
+  RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		inserted_id numeric;
+		_provider_id numeric;
+		_payer_nm109_name TEXT;
+
+	BEGIN
+		SELECT
+			id INTO _provider_id
+		FROM providers
+		WHERE 
+			UPPER(name) = UPPER(_data->>'provider')
+		LIMIT 1;
+
+		IF _provider_id > 0 THEN
+			_payer_nm109_name := UPPER(_data->>'name');
+			IF _payer_nm109_name = '' OR _payer_nm109_name IS NULL THEN
+				_payer_nm109_name := 'N/A';
+			END IF;
+	
+			SELECT id INTO inserted_id
+			FROM payers_nm109
+			WHERE 
+				name = _payer_nm109_name
+			LIMIT 1;
+		
+			IF inserted_id IS NULL THEN 
+				INSERT INTO payers_nm109 (
+					name
+				)
+				VALUES (
+					_payer_nm109_name
+				)
+				RETURNING id INTO inserted_id;
+			END IF;
+
+			INSERT INTO payers_nm109_providers (payer_nm109_id, provider_id)
+			VALUES (inserted_id, _provider_id)
+			ON CONFLICT DO NOTHING;
+		ELSE
+			inserted_id := -1;
+		END IF;
+		
+		RETURN inserted_id;
+	END;
+$function$
+;
+
+--DROP FUNCTION claim_recoverable_remark_code_insert(_claim_recoverable_id int4, _codes text[]);
+CREATE OR REPLACE FUNCTION claim_recoverable_remark_code_insert(_claim_recoverable_id int4, _codes text[])
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_count_claim_recoverable_remark_code_inserted int4 :=0;
+  		_code text;
+  		_rows_inserted int4;
+	BEGIN
+		IF _claim_recoverable_id IS NULL OR _codes IS NULL OR array_length(_codes, 1) IS NULL THEN
+	    	RETURN 0;
+   		END IF;
+		
+	  	FOREACH _code IN ARRAY _codes
+	  		LOOP
+			    INSERT INTO claims_recoverable_remark_code (claim_recoverable_id, code)
+			    VALUES (_claim_recoverable_id, _code)
+			    ON CONFLICT (claim_recoverable_id, code) DO NOTHING;
+		
+		    	GET DIAGNOSTICS _rows_inserted = ROW_COUNT;
+		    	_count_claim_recoverable_remark_code_inserted := _count_claim_recoverable_remark_code_inserted + _rows_inserted;
+  			END LOOP;
+		
+   		RETURN _count_claim_recoverable_remark_code_inserted;
+  	END;
+$function$
+;
+
+--revenue_code
+--DROP FUNCTION claim_recoverable_revenue_code_insert(_claim_recoverable_id int4, _codes text[]);
+CREATE OR REPLACE FUNCTION claim_recoverable_revenue_code_insert(_claim_recoverable_id int4, _codes text[])
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_count_claim_recoverable_revenue_code_inserted int4;
+		_code text;
+  		_rows_inserted int4;
+	BEGIN
+		IF _claim_recoverable_id IS NULL OR _codes IS NULL OR array_length(_codes, 1) IS NULL THEN
+	    	RETURN 0;
+   		END IF;
+		
+	  	FOREACH _code IN ARRAY _codes
+	  		LOOP
+			    INSERT INTO claims_recoverable_revenue_code (claim_recoverable_id, code)
+			    VALUES (_claim_recoverable_id, _code)
+			    ON CONFLICT (claim_recoverable_id, code) DO NOTHING;
+		
+		    	GET DIAGNOSTICS _rows_inserted = ROW_COUNT;
+		    	_count_claim_recoverable_revenue_code_inserted := _count_claim_recoverable_revenue_code_inserted + _rows_inserted;
+  			END LOOP;
+					
+   		RETURN _count_claim_recoverable_revenue_code_inserted;
+  	END;
+$function$
+;
+
+
+--tags
+--DROP FUNCTION claim_recoverable_tags_insert(_claim_recoverable_id int4, _tags text[]);
+CREATE OR REPLACE FUNCTION claim_recoverable_tags_insert(_claim_recoverable_id int4, _tags text[])
+RETURNS integer
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+  _count_claim_recoverable_tags_inserted int4 := 0;
+  _tags_inserted_id INTEGER[] := '{}';
+  _tags_id INTEGER[] := '{}';
+  _tag TEXT;
+  _tag_id int4;
+  _rows_inserted int4;
+  _id int4;
+BEGIN
+
+  IF _claim_recoverable_id IS NULL OR _tags IS NULL OR array_length(_tags, 1) IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  -- Inserção das tags novas (ignora as já existentes)
+  FOREACH _tag IN ARRAY _tags
+  LOOP
+    INSERT INTO claims_tag(name)
+    VALUES (_tag)
+    ON CONFLICT DO NOTHING;
+
+    GET DIAGNOSTICS _rows_inserted = ROW_COUNT;
+
+    IF _rows_inserted = 1 THEN
+      SELECT id INTO _tag_id
+      FROM claims_tag
+      WHERE name = _tag;
+
+      _tags_inserted_id := array_append(_tags_inserted_id, _tag_id);
+    END IF;
+  END LOOP;
+
+  IF _tags_inserted_id IS NOT NULL AND array_length(_tags_inserted_id, 1) > 0 THEN
+    INSERT INTO claims_tag_provider (tag_id, provider_id)
+    SELECT
+      ct.id AS tag_id,
+      p.id AS provider_id
+    FROM claims_tag ct
+    CROSS JOIN providers p
+    WHERE ct.id = ANY(_tags_inserted_id)
+    ORDER BY ct.id, p.id;
+  END IF;
+
+
+  FOREACH _tag IN ARRAY _tags
+	LOOP
+	  SELECT id INTO _tag_id
+	  FROM claims_tag
+	  WHERE name = _tag;
+	
+	  IF _tag_id IS NOT NULL THEN
+	    INSERT INTO claims_recoverable_tag (tag_id, claim_recoverable_id)
+	    VALUES (_tag_id, _claim_recoverable_id)
+	    ON CONFLICT (tag_id, claim_recoverable_id) DO NOTHING;
+	
+	    GET DIAGNOSTICS _rows_inserted = ROW_COUNT;
+	    _count_claim_recoverable_tags_inserted := _count_claim_recoverable_tags_inserted + _rows_inserted;
+	  END IF;
+	END LOOP;
+
+  RETURN _count_claim_recoverable_tags_inserted;
+END;
+$function$;
+
+-- reason_code
+--DROP FUNCTION claim_recoverable_reason_code_insert(_claim_recoverable_id int4, _codes text[])
+CREATE OR REPLACE FUNCTION claim_recoverable_reason_code_insert(_claim_recoverable_id int4, _reason_codes jsonb)
+RETURNS integer
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+  _count_claim_recoverable_reason_code_inserted int4 := 0;
+  _codes text[];
+  _code text;
+  _rows_inserted int4;
+BEGIN
+  SELECT ARRAY(
+    SELECT DISTINCT elem->>'reason_code'
+    FROM jsonb_array_elements(_reason_codes) AS elem
+  ) INTO _codes;
+
+  IF _claim_recoverable_id IS NULL OR _codes IS NULL OR array_length(_codes, 1) IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  FOREACH _code IN ARRAY _codes
+  LOOP
+    INSERT INTO claims_recoverable_reason_code (claim_recoverable_id, code)
+    VALUES (_claim_recoverable_id, _code)
+    ON CONFLICT (claim_recoverable_id, code) DO NOTHING;
+
+    GET DIAGNOSTICS _rows_inserted = ROW_COUNT;
+    _count_claim_recoverable_reason_code_inserted := _count_claim_recoverable_reason_code_inserted + _rows_inserted;
+  END LOOP;
+
+  RETURN _count_claim_recoverable_reason_code_inserted;
+END;
+$function$;

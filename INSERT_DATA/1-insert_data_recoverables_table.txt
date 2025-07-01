@@ -110,25 +110,25 @@ SELECT
 FROM 
 	public.li_reason_code_recoverable li
 JOIN
-	export.edi_exports ee ON li.account_number = ee.account_number AND UPPER(li.provider) = UPPER(ee.provider_name)
+	export.edi_exports ee ON li.account_number = ee.account_number AND UPPER(li.provider) = UPPER(ee.provider_name);
 
-/*INSERT ICD_10_PCS_2024
+/*INSERT ICD_10_PCS_2024*/
 INSERT INTO public_dev_temp.icd_10_pcs_2024 (
 	icd_10_pcs, description
 	)
 SELECT 
 	icd_10_pcs, description
 FROM 
-	public.icd_10_pcs_2024;*/
+	public.icd_10_pcs_2024;
 
-/*INSERT ICD_10_CM_2024
+/*INSERT ICD_10_CM_2024*/
 INSERT INTO public_dev_temp.icd_10_cm_2024 (
 	icd_10_cm, description
 	)
 SELECT 
 	icd_10_cm, description
 FROM 
-	public.icd_10_cm_2024;*/
+	public.icd_10_cm_2024;
 
 /*INSERT EDI837*/
 INSERT INTO public_dev_temp.edi837 (

@@ -93,12 +93,11 @@ INSERT INTO  public_dev_temp.claims_attachments_sub_provider_address (
 	id, description, company_name, address_line1, address_line2, city, 
 	province_or_state, postal_or_zip, country_code, contact, enabled, 
 	is_default, sub_provider_id, created_at, updated_at, deleted_at, 
-	extra_params
+	extra_params )
 SELECT 
 	id, description, company_name, address_line1, address_line2, city, 
 	province_or_state, postal_or_zip, country_code, contact, enabled, 
 	is_default, sub_provider_id, created_at, updated_at, deleted_at, 
 	extra_params
-	)
 FROM 
 	public.claims_attachments_sub_provider_address;

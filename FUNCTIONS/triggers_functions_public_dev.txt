@@ -1,0 +1,346 @@
+--DROP FUNCTION copy_data_by_account(_account_number text, _provider text, _email text)
+CREATE OR REPLACE FUNCTION copy_data_by_account(_account_number text, _provider text, _email text)
+ RETURNS text
+ LANGUAGE plpgsql
+AS $function$
+	DECLARE
+		_claim_recoverable_id_count int4;
+		_claims_recoverable_insert_data text;
+		_new_claim_recoverable_id int4;
+		_encoded_data jsonb;
+		_count_reg int4;
+		_count_claims_recoverable_insert int4 := 0;
+		_count_li_reason_code_recoverable int4 := 0;
+		_count_edi837 int4 := 0;
+		_count_edi835 int4 := 0;
+	BEGIN
+		SELECT count(cr.id) INTO _claim_recoverable_id_count
+		FROM public.claims_recoverable cr
+		JOIN public.sub_providers sp on cr.sub_provider_id = sp.id
+		JOIN public.providers p on sp.provider_id = p.id
+		WHERE account_number = upper(_account_number)
+		AND p.name = upper(_provider)
+		GROUP BY cr.id;
+
+		IF (_claim_recoverable_id_count IS NOT NULL OR _claim_recoverable_id_count > 0) THEN
+			FOR _claims_recoverable_insert_data IN
+				WITH line_items_data as (
+				SELECT
+					lir.claim_recoverable_id,
+					json_agg(
+						json_build_object(
+							'amt02_b6', lir.amt02_b6,
+							'bpr16', lir.bpr16,
+							'carcs', (
+										SELECT json_agg(DISTINCT elem->>'reason_code')::jsonb
+									    FROM jsonb_array_elements(lir.reason_code) AS elem
+						    ),
+							'clp01', lir.clp01,
+							'clp02', lir.clp02,
+							'clp03', lir.clp03,
+							'clp06', lir.clp06,
+							'clp07', lir.clp07,
+							'clp08', lir.clp08 ,
+							'hash', lir.hash,
+							'hcpcs_cpt', lir.svc01_2,
+							'lq', lir.lq,
+							'modifiers', lir.svc01_3,
+							'ndc', lir.nm109_74, -- verificar com o serginho
+							'nm109_74', lir.nm109_74,
+							'nm109_il', lir.nm109_il,
+							'nm109_qc', lir.nm109_qc,
+							'payer_n102', lir.payer_n102,
+							'payer_n102_hash', upper(md5(lir.payer_n102)),
+							'processing', lir.processing,
+							'reason_code', lir.reason_code,
+							'ref02_6r', lir.ref02_6r,
+							'revenue_code', lir.svc04,
+							'svc01_1', lir.svc01_1,
+							'svc01_2', lir.svc01_2,
+							'svc01_3', lir.svc01_3,
+							'svc01_4', lir.svc01_4,
+							'svc01_5', lir.svc01_5,
+							'svc01_6', lir.svc01_6,
+							'svc02', lir.svc02,
+							'svc03', lir.svc03,
+							'svc04', lir.svc04,
+							'svc05', lir.svc05,
+							'svc06_1', lir.svc06_1,
+							'svc06_2', lir.svc06_2,
+							'svc06_3', lir.svc06_3,
+							'svc06_4', lir.svc06_4,
+							'svc06_5', lir.svc06_5,
+							'svc06_6', lir.svc06_6,
+							'svc06_7', lir.svc06_7,
+							'svc07', lir.svc07
+						)
+					) as jsondata
+				from public.line_items_recoverable lir
+				join public.claims_recoverable cr on cr.id = lir.claim_recoverable_id
+				JOIN public.sub_providers sp on cr.sub_provider_id = sp.id
+				JOIN public.providers p on sp.provider_id = p.id
+				where 
+					cr.account_number = upper(_account_number) and
+					p.name = upper(_provider)
+				group by 
+					lir.claim_recoverable_id
+				), data as (	
+					SELECT
+						jsonb_build_object('account_number', cr.account_number) || 
+						jsonb_build_object('bht04', cr.bht04) ||
+						jsonb_build_object('claim_hash', cr.claim_hash) ||
+						jsonb_build_object( 'claims_recoverable_835', 
+							jsonb_build_object('bpr16', cr835.bpr16) ||
+							jsonb_build_object('claim_hash', cr835.claim_hash) ||
+							jsonb_build_object('clp01', cr835.clp01) ||
+							jsonb_build_object('clp02', cr835.clp02) ||
+							jsonb_build_object('clp03', cr835.clp03) ||
+							jsonb_build_object('clp04', cr835.clp04) ||
+							jsonb_build_object('clp06', cr835.clp06) ||
+							jsonb_build_object('clp07', cr835.clp07) ||
+							jsonb_build_object('date_parser', cr835.date_parser) ||
+							jsonb_build_object('file_hash', cr835.file_hash) ||
+							jsonb_build_object('file_name', cr835.file_name) ||
+							jsonb_build_object('payer_n102', cr835.payer_n102)
+							) ||
+						jsonb_build_object( 'claims_recoverable_edi', 
+							jsonb_build_object('edi_pre_proc', cre.edi_pre_proc) ||
+							jsonb_build_object('edi_pre_proc_parsed', cre.edi_pre_proc_parsed)
+						) || 
+						jsonb_build_object('claim_recoverable_id', cr.id) ||
+						jsonb_build_object('clm01', cr.clm01) ||
+						jsonb_build_object('clm02', cr.clm02) ||
+						jsonb_build_object('clm05_1', cr.clm05_1) ||
+						jsonb_build_object('clp04', cr835.clp04) ||
+						jsonb_build_object('date_parser', cr.date_parser) ||
+						jsonb_build_object('description', cr.description) ||
+						jsonb_build_object('extra_params', cr.extra_params) ||
+						jsonb_build_object('file_hash', cr.file_hash) ||
+						jsonb_build_object('file_name', cr.file_name) ||
+						jsonb_build_object('file_type', cr.file_type) ||
+						jsonb_build_object( 'line_items_recoverable', lid.jsondata) ||
+						jsonb_build_object('next_ref02_f8', cr.next_ref02_f8) ||
+						jsonb_build_object('payer_nm103', pa.name) ||
+						jsonb_build_object('payer_nm109', pn.name) ||
+						jsonb_build_object('provider', p.name) ||
+						jsonb_build_object('rarcs', cr.rarcs) ||
+						jsonb_build_object('reason_code', cr.reason_code) ||
+						jsonb_build_object('recoverable_type', crt.name) ||
+						jsonb_build_object('sbr09', cr.sbr09) ||
+						jsonb_build_object('status', crs.name) ||
+						jsonb_build_object('sub_provider', sp.acronym) ||
+						jsonb_build_object('sub_provider_taxid', spt.tax_id) ||
+						jsonb_build_object('total_predicted_amount', cr.total_predicted_amount) ||
+						jsonb_build_object('total_predicted_perc', cr.total_predicted_perc) ||
+						jsonb_build_object('total_reason_amount', cr.total_reason_amount) ||
+						jsonb_build_object('user_fixer_email', '')
+						AS data_insert
+					FROM public.claims_recoverable cr 
+					JOIN public.claims_recoverable_835 cr835 on cr.id = cr835.claim_recoverable_id
+					JOIN public.claims_recoverable_edi cre on cr.id = cre.claim_recoverable_id
+					JOIN public.sub_providers sp on cr.sub_provider_id = sp.id
+					JOIN public.providers p on sp.provider_id = p.id
+					JOIN public.claims_recoverable_status crs on cr.status_id = crs.id
+					JOIN public.claims_recoverable_type crt on cr.recoverable_type_id = crt.id
+					JOIN public.users u on cr.user_fixer_id = u.id
+					LEFT JOIN public.sub_providers_taxid spt on sp.id = spt.sub_provider_id
+					JOIN public.payers pa on cr.payer_id = pa.id
+					JOIN line_items_data lid on cr.id = lid.claim_recoverable_id
+					JOIN public.payers_nm109 pn on cr.payer_nm109_id = pn.id 
+					where 
+						cr.account_number = upper(_account_number) and
+						p.name = upper(_provider)
+					)
+					SELECT encode(convert_to(data_insert::text, 'UTF8'), 'base64')
+					FROM data
+				LOOP
+					BEGIN
+			            PERFORM claims_recoverable_insert(_claims_recoverable_insert_data, _email);
+			            _count_claims_recoverable_insert := _count_claims_recoverable_insert + 1;
+			        EXCEPTION
+			            WHEN OTHERS THEN
+			                RAISE NOTICE 'Erro ao inserir registro. Detalhes: %', SQLERRM;
+			        END;
+					--SELECT claims_recoverable_insert(_claims_recoverable_insert_data, _email);
+				END LOOP;
+		END IF;
+		
+		--li_reason_code_recoverable
+		--delete data
+		DELETE FROM li_reason_code_recoverable WHERE account_number = upper(_account_number) AND provider = upper(_provider); 		
+
+		--insert data
+		INSERT INTO li_reason_code_recoverable  (
+			rn, bpr16, service_end, dos_service_status, days_after_service, claims_distinct_hash, account_number, 
+			claim_hash_835, hash, ref02_6r, payer_n102, payer_n102_hash, clp01, clp02, clp03, clp04, clp04_balance, 
+			clp04_balance_is_zero, clp06, clp07, clp08, dtm02_232, dtm02_233, dtm02_036, dtm02_050, nm109_il, nm109_74,
+			nm109_qc, amt02_b6, lq, group_code, reason_code, reason_amount, reason_amount_is_zero, svc01_1, svc01_2, 
+			svc01_3, svc01_4, svc01_5, svc01_6, svc02, svc03, svc03_balance, svc03_balance_no_6r, min_potentially_svc03,
+			svc04, svc05, svc06_1, svc06_2, svc06_3, svc06_4, svc06_5, svc06_6, svc06_7, svc07, revenue_code, hcpcs_cpt,
+			ndc, modifiers, dtm02_150, dtm02_151, dtm02_472, sub_provider, reason_97, paid_prediction, archived, account_ignored, provider
+			)
+		SELECT 
+			rn, bpr16, service_end, dos_service_status::TEXT::"li_reason_code_recoverable_dos_service_status", days_after_service, claims_distinct_hash, account_number, 
+			claim_hash_835, hash, ref02_6r, payer_n102, payer_n102_hash, clp01, clp02, clp03, clp04, clp04_balance, 
+			clp04_balance_is_zero, clp06, clp07, clp08, dtm02_232, dtm02_233, dtm02_036, dtm02_050, nm109_il, nm109_74,
+			nm109_qc, amt02_b6, lq, group_code, reason_code::TEXT::"carc_enum", reason_amount, reason_amount_is_zero, svc01_1, svc01_2, 
+			svc01_3, svc01_4, svc01_5, svc01_6, svc02, svc03, svc03_balance, svc03_balance_no_6r, min_potentially_svc03,
+			svc04, svc05, svc06_1, svc06_2, svc06_3, svc06_4, svc06_5, svc06_6, svc06_7, svc07, revenue_code, hcpcs_cpt,
+			ndc, modifiers, dtm02_150, dtm02_151, dtm02_472, sub_provider, reason_97, paid_prediction, archived, account_ignored, provider
+		FROM 
+			public.li_reason_code_recoverable
+		WHERE
+			account_number = upper(_account_number) AND
+			provider = upper(_provider);
+		GET DIAGNOSTICS _count_li_reason_code_recoverable = ROW_COUNT;
+			
+		--edi837
+		--delete data
+		DELETE FROM edi837 WHERE account_number = upper(_account_number) AND provider = upper(_provider); 		
+
+		--insert data
+	    INSERT INTO edi837 (
+			account_number, provider, sub_provider, bht04, bht05, clm01, file_hash, file_type, file_name, 
+			loop1000a, loop1000b, loop2000a, loop2000b, loop2000c, date_parser, doc_idx
+			)
+		SELECT 
+			account_number, provider, sub_provider, bht04, bht05, clm01, file_hash, file_type, file_name, 
+			loop1000a, loop1000b, loop2000a, loop2000b, loop2000c, date_parser, doc_idx
+		FROM
+			public.edi837
+		WHERE
+			account_number = upper(_account_number) AND
+			provider = upper(_provider);
+		GET DIAGNOSTICS _count_edi837 = ROW_COUNT;
+		
+		--edi835
+		--delete data
+		DELETE FROM edi835 WHERE account_number = upper(_account_number) AND provider = upper(_provider); 		
+
+		--insert data
+		INSERT INTO edi835 (
+			account_number, provider, sub_provider, bpr16, clp01, file_hash, file_name, 
+			loop1000a, loop1000b, loop2000, date_parser
+			)
+		SELECT 
+			account_number, provider, sub_provider, bpr16, clp01, file_hash, file_name, 
+			loop1000a, loop1000b, loop2000, date_parser
+		FROM 
+			public.edi835
+		WHERE
+			account_number = upper(_account_number) AND
+			provider = upper(_provider);
+		GET DIAGNOSTICS _count_edi835 = ROW_COUNT;
+
+	 RETURN _count_claims_recoverable_insert || ' records were inserted in claims_recoverable_insert table, ' || _count_li_reason_code_recoverable || ' in li_reason_code_recoverable table, ' || _count_edi835 || ' in edi835 table and ' || _count_edi837 || 'in edi837 table';
+  END;
+$function$
+;
+
+-- DROP FUNCTION create_partition_edi835_for_provider();
+CREATE OR REPLACE FUNCTION create_partition_edi835_for_provider()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    partition_name TEXT;
+    provider_name TEXT := NEW.NAME;
+    clean_provider_name TEXT;
+BEGIN
+
+    clean_provider_name := lower(regexp_replace(provider_name, '[^a-zA-Z0-9_]', '', 'g'));
+    clean_provider_name := regexp_replace(clean_provider_name, '^[^a-zA-Z_]+', '', 'g');
+    clean_provider_name := left(clean_provider_name, 50);
+
+    partition_name := lower('edi835') || '_' || clean_provider_name;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = partition_name) THEN
+        EXECUTE FORMAT('CREATE TABLE %I PARTITION OF edi835 FOR VALUES IN (%L)',
+                       partition_name,
+                       provider_name);
+        RAISE NOTICE 'Created partition "%" for provider "%" in table edi835.', partition_name, provider_name;
+    ELSE
+        RAISE NOTICE 'Partition "%" already exists for provider "%" in table edi835.', partition_name, provider_name;
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+-- DROP FUNCTION create_partition_edi837_for_provider();
+CREATE OR REPLACE FUNCTION create_partition_edi837_for_provider()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    partition_name TEXT;
+    provider_name TEXT := NEW.NAME;
+    clean_provider_name TEXT;
+BEGIN
+
+    clean_provider_name := lower(regexp_replace(provider_name, '[^a-zA-Z0-9_]', '', 'g'));
+    clean_provider_name := regexp_replace(clean_provider_name, '^[^a-zA-Z_]+', '', 'g');
+    clean_provider_name := left(clean_provider_name, 50);
+
+    partition_name := lower('edi837') || '_' || clean_provider_name;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = partition_name) THEN
+        EXECUTE FORMAT('CREATE TABLE %I PARTITION OF edi837 FOR VALUES IN (%L)',
+                       partition_name,
+                       provider_name);
+        RAISE NOTICE 'Created partition "%" for provider "%" in table edi837.', partition_name, provider_name;
+    ELSE
+        RAISE NOTICE 'Partition "%" already exists for provider "%" in table edi837.', partition_name, provider_name;
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+-- DROP FUNCTION create_partition_li_reason_code_recoverable_for_provider();
+CREATE OR REPLACE FUNCTION create_partition_li_reason_code_recoverable_for_provider()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    partition_name TEXT;
+    provider_name TEXT := NEW.NAME;
+    clean_provider_name TEXT;
+BEGIN
+
+    clean_provider_name := lower(regexp_replace(provider_name, '[^a-zA-Z0-9_]', '', 'g'));
+    clean_provider_name := regexp_replace(clean_provider_name, '^[^a-zA-Z_]+', '', 'g');
+    clean_provider_name := left(clean_provider_name, 50);
+
+    partition_name := lower('li_reason_code_recoverable') || '_' || clean_provider_name;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = partition_name) THEN
+        EXECUTE FORMAT('CREATE TABLE %I PARTITION OF li_reason_code_recoverable FOR VALUES IN (%L)',
+                       partition_name,
+                       provider_name);
+        RAISE NOTICE 'Created partition "%" for provider "%" in table li_reason_code_recoverable.', partition_name, provider_name;
+    ELSE
+        RAISE NOTICE 'Partition "%" already exists for provider "%" in table li_reason_code_recoverable.', partition_name, provider_name;
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE TRIGGER trg_li_reason_code_recoverable_after_provider_insert
+AFTER INSERT ON Providers
+FOR EACH ROW
+EXECUTE FUNCTION create_partition_li_reason_code_recoverable_for_provider();
+
+CREATE TRIGGER trg_edi835_after_provider_insert
+AFTER INSERT ON Providers
+FOR EACH ROW
+EXECUTE FUNCTION create_partition_edi835_for_provider();
+
+CREATE TRIGGER trg_edi837_after_provider_insert
+AFTER INSERT ON Providers
+FOR EACH ROW
+EXECUTE FUNCTION create_partition_edi837_for_provider();

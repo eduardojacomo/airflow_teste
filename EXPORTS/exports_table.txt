@@ -1,0 +1,11 @@
+CREATE TABLE claims_recoverable (
+	account_number text NOT NULL,
+	provider_name text NOT NULL
+);
+CREATE UNIQUE INDEX claims_recoverable_acccount_number_provider ON claims_recoverable USING btree (account_number, provider_name);
+
+CREATE TABLE edi_exports (
+	account_number text NOT NULL,
+	provider_name text NOT NULL
+);
+CREATE UNIQUE INDEX edi_exports_acccount_number_provider ON edi_exports USING btree (account_number, provider_name);

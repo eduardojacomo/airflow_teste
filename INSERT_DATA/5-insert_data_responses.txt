@@ -1,0 +1,28 @@
+/*INSERT RESPONSES_835*/
+INSERT INTO public_dev.responses_835 (
+	clm01, file_name, file_hash, claim_hash, clp04, clp07, bpr16, date_parser, 
+	payer_id, sub_provider_id, created_at, updated_at, balance, id, 
+	claim_recoverable_id, clp05, reason_code, status_id, clp02, balance_clp04, 
+	balance_clp05, adjustment_clp05
+	)
+SELECT
+	r.clm01, r.file_name, r.file_hash, r.claim_hash, r.clp04, r.clp07, r.bpr16, r.date_parser, 
+	r.payer_id, r.sub_provider_id, r.created_at, r.updated_at, r.balance, r.id, 
+	r.claim_recoverable_id, r.clp05, r.reason_code, r.status_id, r.clp02, r.balance_clp04, 
+	r.balance_clp05, r.adjustment_clp05
+FROM
+	public.responses_835 r
+JOIN
+	public_dev.claims_recoverable cr ON cr.id = r.claim_recoverable_id;
+
+/*INSERT CLAIMS_MANUAL_ADJUSMENT*/	
+INSERT INTO public_dev.claims_manual_adjustment (
+	id, responses_835_id, balance_clp04, balance_clp05
+	)
+SELECT 
+	cma.id, cma.responses_835_id, cma.balance_clp04, cma.balance_clp05
+FROM
+	public.claims_manual_adjustment cma
+JOIN
+	public_dev.responses_835 r on r.id = cma.responses_835_id;
+	

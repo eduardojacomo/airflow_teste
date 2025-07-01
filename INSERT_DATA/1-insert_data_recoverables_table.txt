@@ -223,15 +223,6 @@ SELECT
 FROM 
 	public.claims_contract_type;
 
-/*INSERT SUB_PROVIDERS_TAXID*/
-INSERT INTO public_dev_temp.sub_providers_taxid (
-	id, tax_id, sub_provider, sub_provider_id, created_at
-	)
-SELECT
-	id, tax_id, sub_provider, sub_provider_id, created_at
-FROM
-	public.sub_providers_taxid;
-
 /*INSERT PAYERS_NM109*/
 INSERT INTO public_dev_temp.payers_nm109 (
 	id, "name", created_at

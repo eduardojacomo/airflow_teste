@@ -130,15 +130,6 @@ SELECT
 FROM 
 	public.icd_10_cm_2024;*/
 
-/*INSERT FIX_CATEGORY
-INSERT INTO  public_dev_temp.fix_category (
-	account_number, fix_category
-	)
-SELECT 
-	account_number, fix_category
-FROM 
-	public.fix_category;*/
-
 /*INSERT EDI837*/
 INSERT INTO  public_dev_temp.edi837 (
 	account_number, provider, sub_provider, bht04, bht05, clm01, file_hash, file_type, file_name, 

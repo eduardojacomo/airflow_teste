@@ -275,7 +275,7 @@ INSERT INTO public_dev_temp.sub_providers_dashboard (
 	)
 SELECT 
 	id, acronym, "name", provider_id, npi, tax_id, 
-	group_label, business_unit, created_at, update
+	group_label, business_unit, created_at, updated_at
 FROM 
 	public.sub_providers_dashboard;
 

@@ -100,10 +100,10 @@ INSERT INTO public_dev_temp.li_reason_code_recoverable  (
 	ndc, modifiers, dtm02_150, dtm02_151, dtm02_472, sub_provider, reason_97, paid_prediction, archived, account_ignored, provider
 	)
 SELECT 
-	rn, bpr16, service_end, dos_service_status::TEXT::"li_reason_code_recoverable_dos_service_status", days_after_service, claims_distinct_hash, 
+	rn, bpr16, service_end, dos_service_status::TEXT::public_dev_temp.li_reason_code_recoverable_dos_service_status, days_after_service, claims_distinct_hash, 
 	li.account_number, claim_hash_835, hash, ref02_6r, payer_n102, payer_n102_hash, clp01, clp02, clp03, clp04, clp04_balance, 
 	clp04_balance_is_zero, clp06, clp07, clp08, dtm02_232, dtm02_233, dtm02_036, dtm02_050, nm109_il, nm109_74,
-	nm109_qc, amt02_b6, lq, group_code, reason_code::TEXT::"carc_enum", reason_amount, reason_amount_is_zero, svc01_1, svc01_2, 
+	nm109_qc, amt02_b6, lq, group_code, reason_code::TEXT::public_dev_temp.carc_enum, reason_amount, reason_amount_is_zero, svc01_1, svc01_2, 
 	svc01_3, svc01_4, svc01_5, svc01_6, svc02, svc03, svc03_balance, svc03_balance_no_6r, min_potentially_svc03,
 	svc04, svc05, svc06_1, svc06_2, svc06_3, svc06_4, svc06_5, svc06_6, svc06_7, svc07, revenue_code, hcpcs_cpt,
 	ndc, modifiers, dtm02_150, dtm02_151, dtm02_472, sub_provider, reason_97, paid_prediction, archived, account_ignored, provider
@@ -304,4 +304,5 @@ INSERT INTO public_dev_temp.claims_tags_categories (
 SELECT 
 	id, "name", created_at
 FROM 
+
 	public.claims_tags_categories;

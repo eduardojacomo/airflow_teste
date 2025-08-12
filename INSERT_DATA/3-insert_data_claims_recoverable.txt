@@ -1,0 +1,214 @@
+/*INSERT CLAIMS_RECOVERABLE*/
+INSERT INTO  public_dev_temp.claims_recoverable (
+	id, clm01, file_hash, file_name, date_parser, bht04, claim_hash, 
+	clm02, file_type, next_ref02_f8, account_number, total_reason_amount, 
+	extra_params, description, recoverable_type_id, total_predicted_amount,
+	total_predicted_perc, created_at, updated_at, status_id, payer_id, 
+	sub_provider_id, batch_resubmissions_id, frequency_code, reason_code, 
+	user_fixer_id, payer_nm109, sbr09, rarcs, attachment_id, clm05_1, 
+	revenue_codes, dos_start, dos_end, reviewed_status, reviewed_status_tags, 
+	bypass_edi, claims_contract_type_id, tags, tax_id, payer_nm109_id, claim_id
+)
+SELECT 
+	cr.id, cr.clm01, cr.file_hash, cr.file_name, cr.date_parser, cr.bht04, cr.claim_hash, 
+	cr.clm02, cr.file_type, cr.next_ref02_f8, cr.account_number, cr.total_reason_amount, 
+	cr.extra_params, cr.description, cr.recoverable_type_id, cr.total_predicted_amount,
+	cr.total_predicted_perc, cr.created_at, cr.updated_at, cr.status_id, cr.payer_id, 
+	cr.sub_provider_id, cr.batch_resubmissions_id, cr.frequency_code, cr.reason_code, 
+	cr.user_fixer_id, cr.payer_nm109, cr.sbr09, cr.rarcs, cr.attachment_id, cr.clm05_1, 
+	cr.revenue_codes, cr.dos_start, cr.dos_end, cr.reviewed_status::text::"claims_recoverable_reviewed_status", 
+	cr.reviewed_status_tags, cr.bypass_edi, cr.claims_contract_type_id, cr.tags, cr.tax_id, cr.payer_nm109_id, claim_id
+FROM 
+	public.claims_recoverable cr
+JOIN
+	public.sub_providers sp ON cr.sub_provider_id = sp.id
+JOIN
+	public.providers p ON sp.provider_id = p.id
+JOIN
+	export.claims_recoverable ecr ON cr.account_number = ecr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name);
+	
+/*INSERT CLAIMS_RECOVERABLE_835*/
+INSERT INTO  public_dev_temp.claims_recoverable_835 (
+	claim_recoverable_id, file_hash, claim_hash, file_name, bpr16, clp01, clp04, 
+	clp02, clp03, nm109_il, clp06, clp07, payer_n102, date_parser, nm109_qc, nm109_74, 
+	created_at, updated_at, payer_id, clp05
+)
+SELECT
+	cr835.claim_recoverable_id, cr835.file_hash, cr835.claim_hash, cr835.file_name, cr835.bpr16, cr835.clp01, cr835.clp04, 
+	cr835.clp02, cr835.clp03, cr835.nm109_il, cr835.clp06, cr835.clp07, cr835.payer_n102, cr835.date_parser, cr835.nm109_qc, 
+	cr835.nm109_74, cr835.created_at, cr835.updated_at, cr835.payer_id, cr835.clp05
+FROM
+	public.claims_recoverable_835 cr835
+JOIN 
+	 public_dev_temp.claims_recoverable cr ON cr.id = cr835.claim_recoverable_id;
+
+/*INSERT CLAIMS_RECOVERABLE_COMENTS*/
+INSERT INTO  public_dev_temp.claims_recoverable_comments (
+	claim_recoverable_id, claim_status_id, user_id, user_email, user_info, "comment",
+	comment_type, extra_params, created_at, updated_at
+	)
+SELECT
+	crc.claim_recoverable_id, crc.claim_status_id, crc.user_id, crc.user_email, crc.user_info, 
+	crc."comment", crc.comment_type::text::"claims_recoverable_comments_type_enum",
+	crc.extra_params, crc.created_at, crc.updated_at
+FROM 
+	public.claims_recoverable_comments crc
+JOIN
+	 public_dev_temp.claims_recoverable cr ON cr.id = crc.claim_recoverable_id;
+
+/*INSERT CLAIMS_RECOVERABLE_EDI*/	
+INSERT INTO  public_dev_temp.claims_recoverable_edi (
+	claim_recoverable_id, edi_pre_proc, edi_pre_proc_parsed, edi_resubmission, 
+	edi_resubmission_parsed, created_at, updated_at
+	)
+SELECT
+	cre.claim_recoverable_id, cre.edi_pre_proc, cre.edi_pre_proc_parsed, cre.edi_resubmission, 
+	cre.edi_resubmission_parsed, cre.created_at, cre.updated_at
+FROM
+	public.claims_recoverable_edi cre
+JOIN 
+	 public_dev_temp.claims_recoverable cr ON cr.id = cre.claim_recoverable_id;
+
+/*INSERT LINE_ITEMS_RECOVERABLE*/
+INSERT INTO  public_dev_temp.line_items_recoverable (
+	id, claim_recoverable_id, amt02_b6, bpr16, clp01, clp02, clp03, clp06, clp07, 
+	clp08, hash, lq, nm109_74, nm109_il, nm109_qc, payer_n102, predicted, 
+	reason_amount, reason_code, ref02_6r, svc01_1, svc01_2, svc01_3, svc01_4, 
+	svc01_5, svc01_6, svc02, svc03, svc04, svc05, svc06_1, svc06_2, svc06_3, 
+	svc06_4, svc06_5, svc06_6, svc06_7, svc07, created_at, updated_at, processing
+	)
+SELECT
+	lir.id, lir.claim_recoverable_id, lir.amt02_b6, lir.bpr16, lir.clp01, lir.clp02, 
+	lir.clp03, lir.clp06, lir.clp07, lir.clp08, lir.hash, lir.lq, lir.nm109_74, 
+	lir.nm109_il, lir.nm109_qc, lir.payer_n102, lir.predicted, 
+	lir.reason_amount, lir.reason_code, lir.ref02_6r, lir.svc01_1, lir.svc01_2, 
+	lir.svc01_3, lir.svc01_4, lir.svc01_5, lir.svc01_6, lir.svc02, lir.svc03, lir.svc04,
+	lir.svc05, lir.svc06_1, lir.svc06_2, lir.svc06_3, lir.svc06_4, lir.svc06_5, 
+	lir.svc06_6, lir.svc06_7, lir.svc07, lir.created_at, lir.updated_at, lir.processing
+FROM
+	public.line_items_recoverable lir
+JOIN 
+	 public_dev_temp.claims_recoverable cr ON cr.id = lir.claim_recoverable_id;
+	
+/*INSERT CLAIMS*/
+INSERT INTO  public_dev_temp.claims (
+	claim_id, clp04, balance, claims_recoverable_type_id, created_at, 
+	updated_at, provider_id, balance_clp04, balance_clp05, account_number
+	)
+SELECT
+	c.claim_id, c.clp04, c.balance, c.claims_recoverable_type_id, c.created_at, 
+	c.updated_at, c.provider_id, c.balance_clp04, c.balance_clp05, c.account_number
+FROM
+	public.claims c
+JOIN
+	public.providers p ON c.provider_id = p.id
+JOIN
+	export.claims_recoverable ecr ON c.account_number = ecr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name);
+
+/*INSERT CLAIMS_CONTRACTED_RATE*/
+INSERT INTO  public_dev_temp.claims_contracted_rate (
+	id, claim_recoverable_id, contracted_rate
+	)
+SELECT
+	ccr.id, ccr.claim_recoverable_id, ccr.contracted_rate
+FROM
+	public.claims_contracted_rate ccr
+JOIN 
+	 public_dev_temp.claims_recoverable cr ON cr.id = ccr.claim_recoverable_id;
+
+/*INSERT CLAIMS_RECOVERABLE_AMOUNT_DENIED*/	
+INSERT INTO  public_dev_temp.claims_recoverable_amount_denied (
+	dt, total_recoverable, total_recoverable_amount, 
+	total_potentially_recoverable, total_amount_potentially_recoverable, 
+	sub_provider_id
+	)
+SELECT 
+	dt, total_recoverable, total_recoverable_amount, 
+	total_potentially_recoverable, total_amount_potentially_recoverable, 
+	sub_provider_id
+FROM (
+	SELECT 
+		dt, total_recoverable, total_recoverable_amount, 
+		total_potentially_recoverable, total_amount_potentially_recoverable, 
+		sub_provider_id,
+		row_number() over (partition by to_char(dt, 'yyyy-mm'), sub_provider_id order by total_recoverable_amount desc) idx
+	FROM public.claims_recoverable_amount_denied crad 
+	WHERE
+		TO_CHAR(dt, 'yyyy') >= TO_CHAR(CURRENT_DATE - interval '2 YEAR', 'YYYY')
+) t 
+WHERE
+	idx = 1
+ORDER BY
+	sub_provider_id, dt;
+
+/*INSERT CLAIMS_RECOVERABLE_AMOUNT_AGING*/
+INSERT INTO  public_dev_temp.claims_recoverable_amount_aging (
+	dt, general_total_recoverable, general_total_recoverable_amount, total_recoverable, 
+	total_recoverable_amount, total_potentially_recoverable, total_amount_potentially_recoverable, 
+	sub_provider_id
+	)
+SELECT 
+	dt, general_total_recoverable, general_total_recoverable_amount, total_recoverable, 
+	total_recoverable_amount, total_potentially_recoverable, total_amount_potentially_recoverable, 
+	sub_provider_id
+FROM (
+	SELECT 
+		dt, general_total_recoverable, general_total_recoverable_amount, total_recoverable, 
+		total_recoverable_amount, total_potentially_recoverable, total_amount_potentially_recoverable, 
+		sub_provider_id,
+		row_number() over (partition by to_char(dt, 'yyyy-mm'), sub_provider_id order by total_recoverable_amount desc) idx
+	FROM public.claims_recoverable_amount_aging crad 
+	WHERE
+		TO_CHAR(dt, 'yyyy') >= TO_CHAR(CURRENT_DATE - interval '2 YEAR', 'YYYY')
+) t 
+WHERE
+	idx = 1
+ORDER BY
+	sub_provider_id, dt;
+
+/*INSERT CLAIMS_RECOVERABLE_JOURNAL*/
+INSERT INTO  public_dev_temp.claims_recoverable_journal (
+	id, claims_recoverable_id, user_email, "_data", created_at
+	)
+SELECT 
+	crj.id, crj.claims_recoverable_id, crj.user_email, crj."_data", crj.created_at
+FROM 
+	public.claims_recoverable_journal crj
+JOIN
+	 public_dev_temp.claims_recoverable cr ON cr.id = crj.claims_recoverable_id;
+
+/*INSERT CLAIMS_RECOVERABLE_TAGS*/
+INSERT INTO public_dev_temp.claims_recoverable_tags(
+	tag_id, claim_recoverable_id
+	)
+SELECT 
+	tag_id, claim_recoverable_id
+FROM 
+	public.claims_recoverable_tags;
+
+/*INSERT CLAIMS_RECOVERABLE_REASON_CODE*/
+INSERT INTO public_dev_temp.claims_recoverable_reason_code(
+	code, claim_recoverable_id
+	)
+SELECT 
+	code, claim_recoverable_id
+FROM 
+	public.claims_recoverable_reason_code;
+
+/*INSERT CLAIMS_RECOVERABLE_REMARK_CODE*/
+INSERT INTO public_dev_temp.claims_recoverable_remark_code(
+	code, claim_recoverable_id
+	)
+SELECT 
+	code, claim_recoverable_id
+FROM 
+	public.claims_recoverable_remark_code;
+
+/*INSERT CLAIMS_RECOVERABLE_REVENUE_CODE*/
+INSERT INTO public_dev_temp.claims_recoverable_revenue_code(
+	code, claim_recoverable_id
+	)
+SELECT 
+	code, claim_recoverable_id
+FROM 
+	public.claims_recoverable_revenue_code;

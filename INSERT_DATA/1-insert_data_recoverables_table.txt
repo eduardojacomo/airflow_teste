@@ -1,0 +1,307 @@
+/*INSERT PAYERS*/
+INSERT INTO public_dev_temp.payers (
+	id, "name", normalized_name, created_at, updated_at, nm109
+	)
+SELECT 
+	id, "name", normalized_name, created_at, updated_at, nm109 
+FROM 
+	public.payers;
+
+/*INSERT PROVIDERS*/
+INSERT INTO public_dev_temp.providers (
+	id, "name", created_at, updated_at, config, data_lake_provider
+	)
+SELECT 
+	id, "name", created_at, updated_at, config, data_lake_provider
+FROM 
+	public.providers;
+
+/*INSERT SUB_PROVIDERS*/
+INSERT INTO public_dev_temp.sub_providers (
+	id, acronym, "name", tax_id, provider_id, created_at, updated_at, group_label, business_unit, npi, config, data_lake_sub_provider
+	)
+SELECT 
+	id, acronym, "name", tax_id, provider_id, created_at, updated_at, group_label, business_unit, npi, config, data_lake_sub_provider
+FROM 
+	public.sub_providers;
+
+/*INSERT USERS*/
+INSERT INTO public_dev_temp.users (
+	id, email, "admin", created_at, updated_at, fixer, "name", user_group, deleted_at, timezone, slack_id
+	)
+SELECT 
+	id, email, "admin", created_at, updated_at, fixer, "name", user_group, deleted_at, timezone, slack_id
+FROM 
+	public.users;
+
+/*INSERT USER_PROVIDER_PERMISSIONS*/
+INSERT INTO public_dev_temp.user_provider_permissions (
+	id, user_id, provider_id, created_at
+	)
+SELECT 
+	id, user_id, provider_id, created_at
+FROM 
+	public.user_provider_permissions;
+
+/*INSERT REVENUE_CODES*/
+INSERT INTO public_dev_temp.revenue_codes (
+	code, short_description, long_description
+	)
+SELECT 
+	code, short_description, long_description
+FROM 
+	public.revenue_codes;
+
+/*INSERT REMARK_CODES*/
+INSERT INTO public_dev_temp.remark_codes (
+	code, description
+	)
+SELECT 
+	code, description
+FROM 
+	public.remark_codes;
+
+/*INSERT REASON_CODES*/
+INSERT INTO public_dev_temp.reason_codes (
+	code, description, status
+	)
+SELECT 
+	code, description, status
+FROM 
+	public.reason_codes;
+
+/*INSERT PROCEDURE_CODES*/
+INSERT INTO public_dev_temp.procedure_codes (
+	code, code_type, short_description, long_description, summary, main_interval, main_interval_name
+	)
+SELECT 
+	code, code_type, short_description, long_description, summary, main_interval, main_interval_name
+FROM 
+	public.procedure_codes;
+
+/*INSERT MODIFIERS*/
+INSERT INTO public_dev_temp.modifiers (
+	code, description
+	)
+SELECT 
+	code, description
+FROM 
+	public.modifiers;
+
+/*INSERT LI_REASON_CODE_RECOVERABLE*/
+
+INSERT INTO public_dev_temp.li_reason_code_recoverable  (
+	rn, bpr16, service_end, dos_service_status, days_after_service, claims_distinct_hash, account_number, 
+	claim_hash_835, hash, ref02_6r, payer_n102, payer_n102_hash, clp01, clp02, clp03, clp04, clp04_balance, 
+	clp04_balance_is_zero, clp06, clp07, clp08, dtm02_232, dtm02_233, dtm02_036, dtm02_050, nm109_il, nm109_74,
+	nm109_qc, amt02_b6, lq, group_code, reason_code, reason_amount, reason_amount_is_zero, svc01_1, svc01_2, 
+	svc01_3, svc01_4, svc01_5, svc01_6, svc02, svc03, svc03_balance, svc03_balance_no_6r, min_potentially_svc03,
+	svc04, svc05, svc06_1, svc06_2, svc06_3, svc06_4, svc06_5, svc06_6, svc06_7, svc07, revenue_code, hcpcs_cpt,
+	ndc, modifiers, dtm02_150, dtm02_151, dtm02_472, sub_provider, reason_97, paid_prediction, archived, account_ignored, provider
+	)
+SELECT 
+	rn, bpr16, service_end, dos_service_status::TEXT::public_dev_temp.li_reason_code_recoverable_dos_service_status, days_after_service, claims_distinct_hash, 
+	li.account_number, claim_hash_835, hash, ref02_6r, payer_n102, payer_n102_hash, clp01, clp02, clp03, clp04, clp04_balance, 
+	clp04_balance_is_zero, clp06, clp07, clp08, dtm02_232, dtm02_233, dtm02_036, dtm02_050, nm109_il, nm109_74,
+	nm109_qc, amt02_b6, lq, group_code, reason_code::TEXT::public_dev_temp.carc_enum, reason_amount, reason_amount_is_zero, svc01_1, svc01_2, 
+	svc01_3, svc01_4, svc01_5, svc01_6, svc02, svc03, svc03_balance, svc03_balance_no_6r, min_potentially_svc03,
+	svc04, svc05, svc06_1, svc06_2, svc06_3, svc06_4, svc06_5, svc06_6, svc06_7, svc07, revenue_code, hcpcs_cpt,
+	ndc, modifiers, dtm02_150, dtm02_151, dtm02_472, sub_provider, reason_97, paid_prediction, archived, account_ignored, provider
+FROM 
+	public.li_reason_code_recoverable li
+JOIN
+	export.edi_exports ee ON li.account_number = ee.account_number AND UPPER(li.provider) = UPPER(ee.provider_name);
+
+/*INSERT ICD_10_PCS_2024
+INSERT INTO public_dev_temp.icd_10_pcs_2024 (
+	icd_10_pcs, description
+	)
+SELECT 
+	icd_10_pcs, description
+FROM 
+	public.icd_10_pcs_2024;*/
+
+/*INSERT ICD_10_CM_2024
+INSERT INTO public_dev_temp.icd_10_cm_2024 (
+	icd_10_cm, description
+	)
+SELECT 
+	icd_10_cm, description
+FROM 
+	public.icd_10_cm_2024;*/
+
+/*INSERT FIX_CATEGORY*/
+INSERT INTO public_dev_temp.fix_category (
+	account_number, fix_category
+	)
+SELECT
+	account_number, fix_category
+FROM
+	public.fix_category;
+
+/*INSERT EDI837*/
+INSERT INTO public_dev_temp.edi837 (
+	account_number, provider, sub_provider, bht04, bht05, clm01, file_hash, file_type, file_name, 
+	loop1000a, loop1000b, loop2000a, loop2000b, loop2000c, date_parser, doc_idx
+	)
+SELECT
+	e837.account_number, provider, sub_provider, bht04, bht05, clm01, file_hash, file_type, file_name, 
+	loop1000a, loop1000b, loop2000a, loop2000b, loop2000c, date_parser, doc_idx
+FROM
+	public.edi837 e837
+JOIN
+	export.edi_exports ee ON e837.account_number = ee.account_number AND UPPER(e837.provider) = UPPER(ee.provider_name);
+
+/*INSERT EDI835*/
+INSERT INTO public_dev_temp.edi835 (
+	account_number, provider, sub_provider, bpr16, clp01, file_hash, file_name, 
+	loop1000a, loop1000b, loop2000, date_parser
+	)
+SELECT 
+	e835.account_number, provider, sub_provider, bpr16, clp01, file_hash, file_name, 
+	loop1000a, loop1000b, loop2000, date_parser
+FROM 
+	public.edi835 e835
+JOIN
+	export.edi_exports ee ON e835.account_number = ee.account_number AND UPPER(e835.provider) = UPPER(ee.provider_name);
+
+/*INSERT CLAIMS_RECOVERY_TYPE*/
+INSERT INTO public_dev_temp.claims_recoverable_type (
+	id, "name", created_at, updated_at
+	)
+SELECT 
+	id, "name", created_at, updated_at
+FROM 
+	public.claims_recoverable_type;
+
+/*INSERT CLAIMS_RECOVERABLE_STATUS*/
+INSERT INTO public_dev_temp.claims_recoverable_status (
+	id, "name", created_at, updated_at, description
+	)
+SELECT 
+	id, "name", created_at, updated_at, description
+FROM 
+	public.claims_recoverable_status;
+
+/*INSERT CLAIMS_RECOVERABLE_ARCHIVED*/
+INSERT INTO public_dev_temp.claims_recoverable_archived (
+	id, account_number, clp01, bpr16, payer_n102_hash, payer_n102, claim_hash, 
+	reason, description, attrs, "source", user_name, user_account, provider, 
+	sub_provider, created_at, updated_at
+	)
+SELECT
+	id, account_number, clp01, bpr16, payer_n102_hash, payer_n102, claim_hash, 
+	reason, description, attrs, "source", user_name, user_account, provider, 
+	sub_provider, created_at, updated_at
+FROM
+	public.claims_recoverable_archived;
+
+/*INSERT ACCOUNT_CHARTS*/
+INSERT INTO public_dev_temp.account_charts (
+	id, account_number, description, chart_type, report_type, chart, nlp_run, nlp
+	)
+SELECT 
+	id, account_number, description, chart_type, report_type, chart, nlp_run, nlp
+FROM 
+	public.account_charts;
+
+/*INSERT BATCH_RESUBMISSIONS*/
+INSERT INTO public_dev_temp.batch_resubmissions (
+	id, resubmission_date, description, created_at, updated_at, provider_id
+	)
+SELECT 
+	distinct 
+	br.id, br.resubmission_date, br.description, br.created_at, br.updated_at, br.provider_id
+FROM 
+	public.batch_resubmissions br
+JOIN 
+	public.claims_recoverable cr on br.id = cr.batch_resubmissions_id
+JOIN
+	public.sub_providers sp ON cr.sub_provider_id = sp.id
+JOIN
+	public.providers p ON sp.provider_id = p.id
+JOIN
+	export.claims_recoverable ecr ON ecr.account_number = cr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name);
+
+/*INSERT CLAIMS_CONTRACT_TYPE*/
+INSERT INTO public_dev_temp.claims_contract_type (
+	id, "name", created_at, updated_at
+	)
+SELECT 
+	id, "name", created_at, updated_at
+FROM 
+	public.claims_contract_type;
+
+/*INSERT PAYERS_NM109*/
+INSERT INTO public_dev_temp.payers_nm109 (
+	id, "name", created_at
+	)
+SELECT 
+	id, "name", created_at
+FROM
+	public.payers_nm109;
+
+/*INSERT PAYERS_NM109_PROVIDERS*/
+INSERT INTO public_dev_temp.payers_nm109_providers (
+	payer_nm109_id, provider_id, created_at
+	)
+SELECT 
+	payer_nm109_id, provider_id, created_at
+FROM
+	public.payers_nm109_providers;
+
+/*INSERT CLAIMS_TAGS*/
+INSERT INTO public_dev_temp.claims_tags(
+	id, "name", created_at, claims_tags_categories_id
+	)
+SELECT 
+	id, "name", created_at, claims_tags_categories_id
+FROM 
+	public.claims_tags;
+
+/*INSERT CLAIMS_TAGS_PROVIDER*/
+INSERT INTO public_dev_temp.claims_tags_provider(
+	tag_id, provider_id, "show"
+	)
+SELECT 
+	tag_id, provider_id, "show"
+FROM 
+	public.claims_tags_provider;
+
+/*INSERT SUB_PROVIDERS_DASHBOARD*/
+INSERT INTO public_dev_temp.sub_providers_dashboard (
+	id, acronym, "name", provider_id, npi, tax_id, 
+	group_label, business_unit, created_at, updated_at
+	)
+SELECT 
+	id, acronym, "name", provider_id, npi, tax_id, 
+	group_label, business_unit, created_at, updated_at
+FROM 
+	public.sub_providers_dashboard;
+
+/*INSERT SUB_PROVIDERS_DEFAULT*/
+INSERT INTO public_dev_temp.sub_providers_default (
+	sub_provider_id, default_dashboard_sub_provider_id
+)
+SELECT 
+	sub_provider_id, default_dashboard_sub_provider_id
+FROM 
+	public.sub_providers_default;
+
+/*INSERT SUB_PROVIDERS_TAX_ID*/
+INSERT INTO public_dev_temp.sub_providers_taxid (
+	id, tax_id, sub_provider_id, sub_provider_dashboard_id, created_at
+	)
+SELECT 
+	id, tax_id, sub_provider_id, sub_provider_dashboard_id, created_at
+FROM 
+	public.sub_providers_taxid;
+
+/**/
+INSERT INTO public_dev_temp.claims_tags_categories (
+	id, "name", created_at
+	)
+SELECT 
+	id, "name", created_at
+FROM 
+	public.claims_tags_categories;

@@ -31,25 +31,6 @@ FROM (
 		export.claims_recoverable ecr ON cr.account_number = ecr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name)
 )t;
 
-/*INSERT INVOICES*/	
-INSERT INTO  public_dev_temp.invoices (
-	id, sub_provider_dashboard_id, account_number, clm01, date_parser, recoverable_type_id,
-	payer_id, assigned_claim, past_payer_recovery, past_patient_recovery, 
-	current_payer_recovery, current_patient_recovery, balance_patient, balance_payer, claim_id, claim_contract_type_id
-)
-SELECT
-	i.id, sub_provider_dashboard_id, i.account_number, clm01, date_parser, recoverable_type_id,
-	payer_id, assigned_claim, past_payer_recovery, past_patient_recovery, 
-	current_payer_recovery, current_patient_recovery, balance_patient, balance_payer, i.claim_id, i.claim_contract_type_id
-FROM
-	public.invoices i
-JOIN
-	public.sub_providers_dashboard sp ON i.sub_provider_dashboard_id = sp.id
-JOIN
-	public.providers p ON sp.provider_id = p.id
-JOIN
-	export.claims_recoverable ecr ON i.account_number = ecr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name);
-	
 /*INSERT CLAIMS_REMINDERS*/
 INSERT INTO  public_dev_temp.claims_reminders (
 	id, claim_recoverable_id, reminder_date, reminder_time, reminder_timezone, 
@@ -87,3 +68,23 @@ FROM
 	public.claims_reminders_users cru
 JOIN
 	 public_dev_temp.claims_reminders cre ON cre.id = cru.claim_reminder_id;
+
+/*INSERT INVOICES*/	
+INSERT INTO  public_dev_temp.invoices (
+	id, sub_provider_dashboard_id, account_number, clm01, date_parser, recoverable_type_id,
+	payer_id, assigned_claim, past_payer_recovery, past_patient_recovery, 
+	current_payer_recovery, current_patient_recovery, balance_patient, balance_payer, claim_id, claim_contract_type_id
+)
+SELECT
+	i.id, sub_provider_dashboard_id, i.account_number, clm01, date_parser, recoverable_type_id,
+	payer_id, assigned_claim, past_payer_recovery, past_patient_recovery, 
+	current_payer_recovery, current_patient_recovery, balance_patient, balance_payer, i.claim_id, i.claim_contract_type_id
+FROM
+	public.invoices i
+JOIN
+	public.sub_providers_dashboard sp ON i.sub_provider_dashboard_id = sp.id
+JOIN
+	public.providers p ON sp.provider_id = p.id
+JOIN
+	export.claims_recoverable ecr ON i.account_number = ecr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name);
+	

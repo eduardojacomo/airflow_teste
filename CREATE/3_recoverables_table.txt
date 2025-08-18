@@ -1,0 +1,445 @@
+/*TABLE PROVIDERS*/
+CREATE TABLE providers (
+	id serial4 NOT NULL,
+	"name" text NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	config jsonb NULL,
+	data_lake_provider text NULL,
+	CONSTRAINT provider_pkey PRIMARY KEY (id),
+	CONSTRAINT providers_name_key UNIQUE (name)
+);
+CREATE INDEX provider_name_idx ON providers USING hash (name);
+
+/*TABLE SUB_PROVIDERS*/
+CREATE TABLE sub_providers (
+	id serial4 NOT NULL,
+	acronym text NOT NULL,
+	"name" text NULL,
+	tax_id text NULL,
+	provider_id int4 NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	group_label text NULL,
+	business_unit text NULL,
+	npi text NULL,
+	config jsonb NULL,
+	data_lake_sub_provider text NULL,
+	CONSTRAINT sub_providers_acronym_provider_id_key UNIQUE (acronym, provider_id),
+	CONSTRAINT sub_providers_pkey PRIMARY KEY (id),
+	CONSTRAINT sub_providers_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers(id)
+);
+CREATE INDEX sub_provider_name_idx ON sub_providers USING hash (name);
+
+/*TABLE PAYERS*/
+CREATE TABLE payers (
+	id serial4 NOT NULL,
+	"name" text NOT NULL,
+	normalized_name text NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	nm109 text NULL,
+	CONSTRAINT payers_name_key UNIQUE (name),
+	CONSTRAINT payers_pkey PRIMARY KEY (id)
+);
+
+/*INSERT PROCEDURE_CODES*/
+CREATE TABLE procedure_codes (
+	code text NOT NULL,
+	code_type text NULL,
+	short_description text NULL,
+	long_description text NULL,
+	summary text NULL,
+	main_interval text NULL,
+	main_interval_name text NULL,
+	CONSTRAINT procedures_codes_pkey PRIMARY KEY (code)
+);
+
+/*INSERT REASON_CODES*/
+CREATE TABLE reason_codes (
+	code text NOT NULL,
+	description text NOT NULL,
+	status text NOT NULL
+);
+
+/*TABLE REMARK_CODES*/
+CREATE TABLE remark_codes (
+	code text NOT NULL,
+	description text NOT NULL
+);
+
+/*TABLE REVENUE_CODES*/
+CREATE TABLE revenue_codes (
+	code text NOT NULL,
+	short_description text NULL,
+	long_description text NULL,
+	CONSTRAINT revenue_codes_pkey PRIMARY KEY (code)
+);
+
+/*TABLE USERS*/
+CREATE TABLE users (
+	id serial4 NOT NULL,
+	email text NULL,
+	"admin" bool NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	fixer bool DEFAULT false NOT NULL,
+	"name" text NULL,
+	user_group jsonb DEFAULT '[]'::jsonb NULL,
+	deleted_at timestamp NULL,
+	timezone text NULL,
+	slack_id text NULL,
+	CONSTRAINT users_email_key UNIQUE (email),
+	CONSTRAINT users_pkey PRIMARY KEY (id)
+);
+
+/*TABLE MODIFIERS*/
+CREATE TABLE modifiers (
+	code text NOT NULL,
+	description text NOT NULL
+);
+
+/*TABLE LI_REASON_CODE_RECOVERABLE*/
+CREATE TABLE li_reason_code_recoverable (
+	rn int4 DEFAULT nextval('li_reason_code_recoverable_seq'::regclass) NOT NULL,
+	bpr16 date NULL,
+	service_end date NULL,
+	dos_service_status "li_reason_code_recoverable_dos_service_status" NULL,
+	days_after_service int8 NULL,
+	claims_distinct_hash text NULL,
+	account_number text NULL,
+	claim_hash_835 text NULL,
+	hash text NULL,
+	ref02_6r text NULL,
+	payer_n102 text NULL,
+	payer_n102_hash text NULL,
+	clp01 text NULL,
+	clp02 text NULL,
+	clp03 numeric NULL,
+	clp04 numeric NULL,
+	clp04_balance numeric NULL,
+	clp04_balance_is_zero bool NULL,
+	clp06 text NULL,
+	clp07 text NULL,
+	clp08 text NULL,
+	dtm02_232 text NULL,
+	dtm02_233 text NULL,
+	dtm02_036 text NULL,
+	dtm02_050 text NULL,
+	nm109_il text NULL,
+	nm109_74 text NULL,
+	nm109_qc text NULL,
+	amt02_b6 numeric NULL,
+	lq jsonb DEFAULT '[]'::jsonb NULL,
+	group_code text NULL,
+	reason_code "carc_enum" NULL,
+	reason_amount numeric NULL,
+	reason_amount_is_zero bool NULL,
+	svc01_1 text NULL,
+	svc01_2 text NULL,
+	svc01_3 text NULL,
+	svc01_4 text NULL,
+	svc01_5 text NULL,
+	svc01_6 text NULL,
+	svc02 text NULL,
+	svc03 numeric NULL,
+	svc03_balance numeric NULL,
+	svc03_balance_no_6r numeric NULL,
+	min_potentially_svc03 numeric NULL,
+	svc04 text NULL,
+	svc05 text NULL,
+	svc06_1 text NULL,
+	svc06_2 text NULL,
+	svc06_3 text NULL,
+	svc06_4 text NULL,
+	svc06_5 text NULL,
+	svc06_6 text NULL,
+	svc06_7 text NULL,
+	svc07 text NULL,
+	revenue_code text NULL,
+	hcpcs_cpt text NULL,
+	ndc text NULL,
+	modifiers jsonb DEFAULT '[]'::jsonb NULL,
+	dtm02_150 text NULL,
+	dtm02_151 text NULL,
+	dtm02_472 text NULL,
+	sub_provider text NULL,
+	reason_97 numeric NULL,
+	paid_prediction numeric NULL,
+	archived bool NULL,
+	account_ignored bool NULL,
+	provider text NOT NULL
+)
+PARTITION BY LIST (provider);
+CREATE INDEX li_rcr_provider_account_number_idx ON ONLY li_reason_code_recoverable USING btree (provider, account_number);
+CREATE INDEX li_rcr_accn ON li_reason_code_recoverable USING btree (account_number);
+CREATE INDEX li_rcr_c1 ON li_reason_code_recoverable USING btree (clp01);
+CREATE INDEX li_rcr_search_1 ON li_reason_code_recoverable USING btree (bpr16, reason_code, group_code, clp06, payer_n102_hash, clp02, days_after_service, archived, account_ignored, reason_amount DESC, clp04_balance_is_zero, rn);
+
+/*TABLE ICD_10_PCS_2024*/
+CREATE TABLE icd_10_pcs_2024 (
+	icd_10_pcs varchar(255) NULL,
+	description varchar(300) NULL
+);
+
+/*TABLE ICD_10_CM_2024*/
+CREATE TABLE icd_10_cm_2024 (
+	icd_10_cm varchar(255) NULL,
+	description varchar(300) NULL
+);
+
+/*TABLE FIX_CATEGORY*/
+CREATE TABLE fix_category (
+	account_number text NULL,
+	fix_category varchar(50) NULL
+);
+
+/*TABLE EDI837*/
+CREATE TABLE edi837 (
+	account_number text NULL,
+	provider text NOT NULL,
+	sub_provider text NOT NULL,
+	bht04 date NULL,
+	bht05 text NULL,
+	clm01 text NOT NULL,
+	file_hash text NOT NULL,
+	file_type text NOT NULL,
+	file_name text NOT NULL,
+	loop1000a text NOT NULL,
+	loop1000b text NOT NULL,
+	loop2000a text NOT NULL,
+	loop2000b text NOT NULL,
+	loop2000c text NULL,
+	date_parser text NOT NULL,
+	doc_idx text NULL
+)
+PARTITION BY LIST (provider);
+CREATE INDEX edi837_provider_account_number_idx ON ONLY edi837 USING btree (provider, account_number);
+CREATE INDEX edi837_provider_date_parser_idx ON ONLY edi837 USING btree (provider, date_parser);
+CREATE INDEX edi837_provider_idx ON ONLY edi837 USING btree (provider);
+CREATE INDEX edi837_provider_sub_provider_account_number_idx ON ONLY edi837 USING btree (provider, sub_provider, account_number);
+
+/*TABLE EDI835*/
+CREATE TABLE edi835 (
+	account_number text NULL,
+	provider text NOT NULL,
+	sub_provider text NOT NULL,
+	bpr16 date NULL,
+	clp01 text NOT NULL,
+	file_hash text NOT NULL,
+	file_name text NOT NULL,
+	loop1000a text NOT NULL,
+	loop1000b text NOT NULL,
+	loop2000 text NOT NULL,
+	date_parser text NOT NULL
+)
+PARTITION BY LIST (provider);
+CREATE INDEX edi835_provider_account_number_idx ON ONLY edi835 USING btree (provider, account_number);
+CREATE INDEX edi835_provider_date_parser_idx ON ONLY edi835 USING btree (provider, date_parser);
+CREATE INDEX edi835_provider_idx ON ONLY edi835 USING btree (provider);
+CREATE INDEX edi835_provider_sub_provider_account_number_idx ON ONLY edi835 USING btree (provider, sub_provider, account_number);
+
+/*TABLE CLAIMS_RECOVERABLE_TABLE*/
+CREATE TABLE claims_recoverable_type (
+	id serial4 NOT NULL,
+	"name" text NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL
+);
+CREATE INDEX claims_recoverable_type_name_idx ON claims_recoverable_type USING btree (name);
+
+/*TABLE CLAIMS_RECOVERABLE_STATUS*/
+CREATE TABLE claims_recoverable_status (
+	id serial4 NOT NULL,
+	"name" text NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	description text NULL,
+	CONSTRAINT claims_recoverable_status_pkey PRIMARY KEY (id)
+);
+CREATE INDEX claims_recoverable_status_idx ON claims_recoverable_status USING hash (name);
+
+/*TABLE CLAIMS_RECOVERABLE_JOURNAL*/
+CREATE TABLE claims_recoverable_journal (
+	id serial4 NOT NULL,
+	claims_recoverable_id int4 NULL,
+	user_email text NULL,
+	"_data" jsonb NULL,
+	created_at timestamp DEFAULT now() NOT NULL
+);
+
+/*TABLE CLAIMS_RECOVERABLE_ARCHIVED*/
+CREATE TABLE claims_recoverable_archived (
+	id int8 DEFAULT nextval('claims_recoverable_archived_seq'::regclass) NOT NULL,
+	account_number text NOT NULL,
+	clp01 text NOT NULL,
+	bpr16 date NOT NULL,
+	payer_n102_hash text NOT NULL,
+	payer_n102 text NULL,
+	claim_hash text NULL,
+	reason text NOT NULL,
+	description text DEFAULT ''::text NULL,
+	attrs jsonb NULL,
+	"source" text NOT NULL,
+	user_name text NOT NULL,
+	user_account text NOT NULL,
+	provider text NOT NULL,
+	sub_provider text NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT claims_recoverable_archived_pkey PRIMARY KEY (account_number, clp01, bpr16, payer_n102_hash, provider)
+);
+CREATE INDEX claims_recoverable_archived_claim_hash_provider_idx ON claims_recoverable_archived USING hash (claim_hash);
+CREATE INDEX claims_recoverable_archived_clp01_provider_idx ON claims_recoverable_archived USING btree (clp01, provider);
+CREATE INDEX claims_recoverable_archived_id_idx ON claims_recoverable_archived USING btree (id);
+
+/*TABLE ACCOUNT_CHARTS*/
+CREATE TABLE account_charts (
+	id int4 DEFAULT nextval('account_charts_seq'::regclass) NOT NULL,
+	account_number varchar(255) NOT NULL,
+	description varchar(255) DEFAULT ''::character varying NULL,
+	chart_type varchar(60) DEFAULT 'REPORT'::character varying NULL,
+	report_type varchar(60) DEFAULT 'REPORT'::character varying NULL,
+	chart text NOT NULL,
+	nlp_run bool DEFAULT true NOT NULL,
+	nlp jsonb NULL,
+	CONSTRAINT account_number_pkey PRIMARY KEY (id)
+);
+CREATE INDEX idx_account_charts_account_number ON account_charts USING btree (account_number);
+
+/*TABLE USER_PROVIDER_PERMISSIONS*/
+CREATE TABLE user_provider_permissions (
+	id serial4 NOT NULL,
+	user_id int4 NULL,
+	provider_id int4 NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT user_provider_permissions_pkey PRIMARY KEY (id),
+	CONSTRAINT user_provider_permissions_user_id_provider_id_key UNIQUE (user_id, provider_id),
+	CONSTRAINT user_provider_permissions_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers(id),
+	CONSTRAINT user_provider_permissions_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+/*TABLE BATCH_RESUBMISSIONS*/
+CREATE TABLE batch_resubmissions (
+	id bigserial NOT NULL,
+	resubmission_date date NULL,
+	description text NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	provider_id int4 NULL,
+	CONSTRAINT batch_resubmissions_pkey PRIMARY KEY (id),
+	CONSTRAINT batch_resubmissions_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id)
+);
+CREATE INDEX batch_resubmissions_resubmission_date_idx ON batch_resubmissions USING btree (resubmission_date);
+
+/*TABLE CLAIMS_CONTRACT_TYPE*/
+CREATE TABLE claims_contract_type (
+	id serial4 NOT NULL,
+	"name" text NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT claims_contract_type_id_pkey PRIMARY KEY (id),
+	CONSTRAINT claims_contract_type_name_key UNIQUE (name)
+);
+CREATE INDEX claims_contract_type_name_idx ON claims_contract_type USING btree (name);
+
+/*TABLE PAYERS_NM109*/
+CREATE TABLE payers_nm109 (
+	id serial4 NOT NULL,
+	"name" text NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT payers_nm109_id_pkey PRIMARY KEY (id)
+);
+CREATE INDEX payers_nm109_name_idx ON payers_nm109 USING btree (name);
+
+/*TABLE PAYERS_NM109_PROVIDERS*/
+CREATE TABLE payers_nm109_providers (
+	payer_nm109_id int4 NOT NULL,
+	provider_id int4 NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT payers_nm109_providers_payer_nm109_id_fkey FOREIGN KEY (payer_nm109_id) REFERENCES payers_nm109(id) ON UPDATE CASCADE,
+	CONSTRAINT payers_nm109_providers_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers(id) ON UPDATE CASCADE
+);
+CREATE INDEX payers_nm109_providers_payer_nm109_id_idx ON payers_nm109_providers USING btree (payer_nm109_id);
+CREATE INDEX payers_nm109_providers_provider_id_idx ON payers_nm109_providers USING btree (provider_id);
+CREATE UNIQUE INDEX payers_nm109_providers_row_idx ON payers_nm109_providers USING btree (payer_nm109_id, provider_id);
+
+/*TABLE CLAIMS_TAGS*/
+CREATE TABLE claims_tags (
+	id int4 DEFAULT nextval('claims_tags_seq'::regclass) NOT NULL,
+	"name" text NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	claims_tags_categories_id int4 NULL,
+	CONSTRAINT claims_tags_name_key UNIQUE (name),
+	CONSTRAINT claims_tags_pkey PRIMARY KEY (id)
+);
+
+/*TABLE SUB_PROVIDER_DASHBOARD*/
+CREATE TABLE sub_providers_dashboard (
+	id serial4 NOT NULL,
+	acronym text NOT NULL,
+	"name" text NULL,
+	provider_id int4 NOT NULL,
+	npi text NULL,
+	tax_id text NULL,
+	group_label text NULL,
+	business_unit text NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	updated_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT sub_providers_dashboard_acronym_provider_id_key UNIQUE (acronym, provider_id),
+	CONSTRAINT sub_providers_dashboard_pkey PRIMARY KEY (id),
+	CONSTRAINT sub_providers_dashboard_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers(id)
+);
+
+/*TABLE SUB_PROVIDER_DEFAULT*/
+CREATE TABLE sub_providers_default (
+	sub_provider_id int4 NOT NULL,
+	default_dashboard_sub_provider_id int4 NOT NULL,
+	CONSTRAINT sub_providers_default_row_key UNIQUE (sub_provider_id),
+	CONSTRAINT sub_providers_default_def_dash_sub_provider_id_fkey FOREIGN KEY (default_dashboard_sub_provider_id) REFERENCES sub_providers_dashboard(id),
+	CONSTRAINT sub_providers_default_sub_provider_id_fkey FOREIGN KEY (sub_provider_id) REFERENCES sub_providers(id)
+);
+CREATE INDEX sub_provider_dashboard_def_dash_sub_provider_id_idx ON sub_providers_default USING hash (default_dashboard_sub_provider_id);
+CREATE INDEX sub_provider_dashboard_sub_provider_id_idx ON sub_providers_default USING hash (sub_provider_id);
+
+/*TABLE CLAIMS_SUB_PROVIDER_TAX_ID*/
+CREATE TABLE sub_providers_taxid (
+	id serial4 NOT NULL,
+	tax_id text NOT NULL,
+	sub_provider_id int4 NOT NULL,
+	sub_provider_dashboard_id int4 NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT sub_providers_taxid_pkey PRIMARY KEY (id),
+	CONSTRAINT sub_providers_taxid_sub_provider_id_key UNIQUE (tax_id, sub_provider_id),
+	CONSTRAINT sub_providers_taxid_sub_provider_dashboard_id_fkey FOREIGN KEY (sub_provider_dashboard_id) REFERENCES sub_providers_dashboard(id),
+	CONSTRAINT sub_providers_taxid_sub_provider_id_fkey FOREIGN KEY (sub_provider_id) REFERENCES sub_providers(id)
+);
+CREATE INDEX sub_providers_taxid_tax_id_idx ON sub_providers_taxid USING hash (tax_id);
+
+/*TABLE CLAIMS_TAGS_PROVIDER*/
+CREATE TABLE claims_tags_provider (
+	tag_id int4 NOT NULL,
+	provider_id int4 NOT NULL,
+	"show" bool DEFAULT false NOT NULL,
+	CONSTRAINT claims_tags_provider_claim_recoverable_id_fkey FOREIGN KEY (provider_id) REFERENCES providers(id) ON UPDATE CASCADE,
+	CONSTRAINT claims_tags_provider_tag_id_fkey FOREIGN KEY (tag_id) REFERENCES claims_tags(id) ON UPDATE CASCADE
+);
+CREATE UNIQUE INDEX claims_tag_provider_row_idx ON claims_tags_provider USING btree (tag_id, provider_id);
+
+/*TABLE CLAIMS_TAGS_CATEGORIES*/
+CREATE TABLE claims_tags_categories (
+	id int4 DEFAULT nextval('claims_tags_categories_seq'::regclass) NOT NULL,
+	"name" text NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT claims_tags_categories_name_key UNIQUE (name),
+	CONSTRAINT claims_tags_categories_pkey PRIMARY KEY (id)
+);
+
+/*TABLE CLAIMS_REVIEWED_STATUS_TAGS*/
+CREATE TABLE claims_reviewed_status_tags (
+	id int4 DEFAULT nextval('claims_reviewed_status_tags_seq'::regclass) NOT NULL,
+	"name" text NOT NULL,
+	created_at timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT claims_reviewed_satatus_tags_pkey PRIMARY KEY (id),
+	CONSTRAINT claims_reviewed_satatus_tags_name_key UNIQUE (name)
+);

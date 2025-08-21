@@ -1,0 +1,104 @@
+/*INSERT CLAIMS_ATTACHMENTS_VENDOR*/
+INSERT INTO claims_attachments_vendor (
+	id, "name", hash, description, extra_params, by_mail, fax, edi_275, is_default,
+	created_at, updated_at, deleted_at
+	)
+SELECT 
+	id, "name", hash, description, extra_params, by_mail, fax, edi_275, is_default, 
+	created_at, updated_at, deleted_at
+FROM 
+	public.claims_attachments_vendor;
+
+/*INSERT CLAIMS_ATTACHMENTS_COVER_LETTER*/
+INSERT INTO claims_attachments_cover_letter (
+	id, description, "template", enabled, is_default, extra_params, provider_id, created_at, 
+	updated_at, deleted_at
+	)
+SELECT
+	id, description, "template", enabled, is_default, extra_params, provider_id, created_at, 
+	updated_at, deleted_at
+FROM 
+	public.claims_attachments_cover_letter;
+
+/*INSERT CLAIMS_ATTACHMENTS*/
+INSERT INTO claims_attachments (
+    id, account_number, clm01, claim_hash, bht04, payer_id, payer_info, vendor_id,
+    report_type, "comments", claim_info, contact_info, mail_from, mail_to,
+    mail_info, mail_post_id, mail_status, cover_letter_id, sub_provider_id,
+    extra_params, created_at, updated_at, deleted_at, delivery_type
+)
+SELECT
+    ca.id, ca.account_number, ca.clm01, ca.claim_hash, ca.bht04, ca.payer_id, ca.payer_info, ca.vendor_id,
+    ca.report_type::text::"claims_attachments_report_type_enum",
+    ca."comments", claim_info, contact_info, mail_from, mail_to,
+    ca.mail_info, ca.mail_post_id,
+    ca.mail_status::text::"claims_attachments_mail_status_enum",
+    ca.cover_letter_id, ca.sub_provider_id,
+    ca.extra_params, ca.created_at, ca.updated_at, ca.deleted_at,
+    ca.delivery_type::text::"delivery_type_enum"
+FROM
+    public.claims_attachments ca
+JOIN
+	public.sub_providers sp ON ca.sub_provider_id = sp.id
+JOIN
+	public.providers p ON sp.provider_id = p.id
+JOIN
+	export.claims_recoverable ecr ON ca.account_number = ecr.account_number AND upper(ecr.provider_name) = upper(p.name);
+	
+/*INSERT CLAIMS_ATTACHMENTS_VENDOR*/
+INSERT INTO claims_attachments_cover_letter_sub_provider (
+	cover_letter_id, sub_provider_id, is_default, created_at)
+SELECT 
+	cover_letter_id, sub_provider_id, is_default, created_at
+FROM 
+	public.claims_attachments_cover_letter_sub_provider;
+
+/*INSERT CLAIMS_ATTACHMENTS_LOGS*/	
+INSERT INTO claims_attachments_logs (
+	claims_attachments_id, attachment_info, description, user_email, created_at
+)
+SELECT 
+	cal.claims_attachments_id, cal.attachment_info, cal.description, cal.user_email, cal.created_at
+FROM 
+	public.claims_attachments_logs cal
+JOIN 
+	 public_dev_temp.claims_attachments ca on ca.id = cal.claims_attachments_id;
+
+/*INSERT CLAIMS_ATTACHMENTS_PAYER_ADDRESS*/	
+INSERT INTO claims_attachments_payer_address (
+	id, payer_id, company_name, address_line1, address_line2, city, province_or_state, 
+	postal_or_zip, country_code, enabled, is_default, created_at, updated_at, deleted_at, 
+	extra_params
+	)
+SELECT  
+	id, payer_id, company_name, address_line1, address_line2, city, province_or_state, 
+	postal_or_zip, country_code, enabled, is_default, created_at, updated_at, deleted_at, 
+	extra_params
+FROM
+	public.claims_attachments_payer_address;
+
+/*INSERT CLAIMS_ATTACHMENTS_SENT*/	
+INSERT INTO claims_attachments_sent (
+	id, created_at, claims_attachments_id
+	)
+SELECT 
+	cas.id, cas.created_at, cas.claims_attachments_id
+FROM 
+	public.claims_attachments_sent cas
+JOIN 
+	 public_dev_temp.claims_attachments ca on ca.id = cas.claims_attachments_id;
+
+/*INSERT CLAIMS_ATTACHMENTS_SUB_PROVIDER_ADDRESS*/	
+INSERT INTO claims_attachments_sub_provider_address (
+	id, description, company_name, address_line1, address_line2, city, 
+	province_or_state, postal_or_zip, country_code, contact, enabled, 
+	is_default, sub_provider_id, created_at, updated_at, deleted_at, 
+	extra_params
+	)
+SELECT 
+	id, description, company_name, address_line1, address_line2, city, 
+	province_or_state, postal_or_zip, country_code, contact, enabled, 
+	is_default, sub_provider_id, created_at, updated_at, deleted_at, 
+	extra_params
+FROM 
+	public.claims_attachments_sub_provider_address;

@@ -1,0 +1,89 @@
+/*INSERT CLAIMS_DIVERGENT_WAITING*/
+INSERT INTO claims_divergent_waiting (
+	id, account_number, provider_id, balance_clp04, balance_clp05, 
+	"comments", created_at, updated_at
+	)
+SELECT
+	cdw.id, cdw.account_number, cdw.provider_id, cdw.balance_clp04, cdw.balance_clp05, 
+	cdw."comments", cdw.created_at, cdw.updated_at
+FROM
+	public.claims_divergent_waiting cdw
+JOIN
+	public.providers p ON cdw.provider_id = p.id
+JOIN
+	exports.claims_recoverable_export_from_public_to_new_db ecr ON cdw.account_number = ecr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name);
+	
+/*INSERT CLAIMS_INITIAL_VALUES*/
+INSERT INTO claims_initial_values (
+	id, claim_id, provider_id, initial_clp04, initial_clp05
+	)
+SELECT distinct *
+FROM (
+	SELECT 
+		civ.id, civ.claim_id, provider_id, initial_clp04, initial_clp05
+	FROM
+		public.claims_initial_values civ
+	JOIN
+		public.providers p ON civ.provider_id = p.id
+	JOIN
+		public.claims_recoverable cr ON civ.claim_id = cr.claim_id
+	JOIN
+		exports.claims_recoverable_export_from_public_to_new_db ecr ON cr.account_number = ecr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name)
+)t;
+
+/*INSERT INVOICES*/	
+INSERT INTO invoices (
+	id, sub_provider_dashboard_id, account_number, clm01, date_parser, recoverable_type_id,
+	payer_id, assigned_claim, past_payer_recovery, past_patient_recovery, 
+	current_payer_recovery, current_patient_recovery, balance_patient, balance_payer, claim_id, claim_contract_type_id
+)
+SELECT
+	i.id, sub_provider_dashboard_id, i.account_number, clm01, date_parser, recoverable_type_id,
+	payer_id, assigned_claim, past_payer_recovery, past_patient_recovery, 
+	current_payer_recovery, current_patient_recovery, balance_patient, balance_payer, i.claim_id, i.claim_contract_type_id
+FROM
+	public.invoices i
+JOIN
+	public.sub_providers_dashboard sp ON i.sub_provider_dashboard_id = sp.id
+JOIN
+	public.providers p ON sp.provider_id = p.id
+JOIN
+	exports.claims_recoverable_export_from_public_to_new_db ecr ON i.account_number = ecr.account_number AND UPPER(ecr.provider_name) = UPPER(p.name);
+	
+/*INSERT CLAIMS_REMINDERS*/
+INSERT INTO claims_reminders (
+	id, claim_recoverable_id, reminder_date, reminder_time, reminder_timezone, 
+	user_id, "comment", created_at, updated_at, reminder_closed
+	)
+SELECT
+	cre.id, cre.claim_recoverable_id, cre.reminder_date, cre.reminder_time, cre.reminder_timezone, 
+	cre.user_id, cre."comment", cre.created_at, cre.updated_at, cre.reminder_closed
+FROM
+	public.claims_reminders cre
+JOIN
+	 public_dev_temp.claims_recoverable cr on cr.id = cre.claim_recoverable_id;
+
+/*INSERT CLAIMS_REMINDERS_CLOSED*/	
+INSERT INTO claims_reminders_closed (
+	claim_reminder_id, user_id, "comment", created_at
+	)
+SELECT
+	crc.claim_reminder_id, crc.user_id, crc."comment", crc.created_at
+FROM
+	public.claims_reminders_closed crc
+JOIN
+	 public_dev_temp.claims_reminders cre ON cre.id = crc.claim_reminder_id;
+
+/*INSERT CLAIMS_REMINDERS_USERS*/
+INSERT INTO claims_reminders_users (
+	claim_reminder_id, user_id, reminder_timezone, permission_status, 
+	user_reminded, reminded_at, created_at, updated_at
+	)
+SELECT
+	cru.claim_reminder_id, cru.user_id, cru.reminder_timezone, 
+	cru.permission_status::TEXT:: public_dev_temp.claims_reminders_users_status_enum AS permission_status, 
+	cru.user_reminded, cru.reminded_at, cru.created_at, cru.updated_at
+FROM
+	public.claims_reminders_users cru
+JOIN
+	 public_dev_temp.claims_reminders cre ON cre.id = cru.claim_reminder_id;
